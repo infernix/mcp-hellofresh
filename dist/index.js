@@ -17,6 +17,9 @@ const GetMenuSchema = zod_1.z.object({
         .default(0)
         .describe("Week offset from current week (0 = current, 1 = next week, etc.)"),
 });
+const GetMenuForWeekSchema = zod_1.z.object({
+    week_id: zod_1.z.string().describe("The week identifier (e.g. '2024-W01') for the delivery"),
+});
 const GetRecipeDetailsSchema = zod_1.z.object({
     recipe_id: zod_1.z.string().describe("The unique recipe identifier"),
 });
@@ -38,6 +41,52 @@ const SelectMealsSchema = zod_1.z.object({
         .min(1)
         .describe("List of meals to select"),
 });
+const PreviewSelectMealsSchema = SelectMealsSchema;
+const AddRecommendedExtrasSchema = zod_1.z.object({
+    week_id: zod_1.z.string().describe("The week identifier (e.g. '2024-W01') for the delivery"),
+});
+const GetRecommendedExtrasSchema = zod_1.z.object({
+    week_id: zod_1.z.string().describe("The week identifier (e.g. '2024-W01') for the delivery"),
+    recipe_ids: zod_1.z
+        .array(zod_1.z.string())
+        .optional()
+        .describe("Optional subset of currently selected meal recipe IDs to inspect for meal-specific recommended extras"),
+});
+const SetMealExtrasSchema = zod_1.z.object({
+    week_id: zod_1.z.string().describe("The week identifier (e.g. '2024-W01') for the delivery"),
+    extras: zod_1.z
+        .array(zod_1.z.object({
+        addon_index: zod_1.z.number().int().describe("The add-on index from get_recommended_extras"),
+        meal_index: zod_1.z.number().int().optional().describe("The selected meal index this add-on should attach to"),
+        meal_recipe_id: zod_1.z.string().optional().describe("Alternative to meal_index: selected meal recipe ID this add-on should attach to"),
+        quantity: zod_1.z.number().int().min(1).max(10).optional().describe("Quantity to request for this add-on"),
+    }))
+        .min(1)
+        .describe("Exact add-ons to apply to selected meals"),
+});
+const PreviewMealExtrasSchema = SetMealExtrasSchema;
+const WeekPlanMealSchema = zod_1.z.object({
+    recipe_id: zod_1.z.string().describe("Recipe ID to select"),
+    servings: zod_1.z
+        .number()
+        .int()
+        .min(1)
+        .max(6)
+        .optional()
+        .describe("Number of servings (defaults to subscription default)"),
+    extras: zod_1.z
+        .array(zod_1.z.object({
+        addon_index: zod_1.z.number().int().describe("Add-on index attached to this meal"),
+        quantity: zod_1.z.number().int().min(1).max(10).optional().describe("Quantity to request for this add-on"),
+    }))
+        .optional()
+        .describe("Optional meal-specific extras to attach to this selected meal"),
+});
+const ApplyWeekPlanSchema = zod_1.z.object({
+    week_id: zod_1.z.string().describe("The week identifier (e.g. '2024-W01') for the delivery"),
+    meals: zod_1.z.array(WeekPlanMealSchema).min(1).describe("Meals to select, each with optional meal-bound extras"),
+});
+const PreviewWeekPlanSchema = ApplyWeekPlanSchema;
 const SkipWeekSchema = zod_1.z.object({
     week_id: zod_1.z.string().describe("The week identifier to skip (e.g. '2024-W01')"),
 });
@@ -132,6 +181,20 @@ const TOOLS = [
         },
     },
     {
+        name: "get_menu_for_week",
+        description: "Get the available recipes/meals for a specific delivery week, including which meals are already selected.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+            },
+            required: ["week_id"],
+        },
+    },
+    {
         name: "get_recipe_details",
         description: "Get full recipe information including ingredients, step-by-step instructions, nutrition facts, prep time, and allergen information.",
         inputSchema: {
@@ -143,6 +206,86 @@ const TOOLS = [
                 },
             },
             required: ["recipe_id"],
+        },
+    },
+    {
+        name: "preview_select_meals",
+        description: "Preview selecting meals for a week without changing the account. Shows current selection, requested selection, added/removed meals, and premium charges.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+                meals: {
+                    type: "array",
+                    description: "List of meals to preview selecting",
+                    items: {
+                        type: "object",
+                        properties: {
+                            recipe_id: { type: "string", description: "Recipe ID or menu index to select" },
+                            servings: {
+                                type: "number",
+                                description: "Number of copies of this meal (optional)",
+                                minimum: 1,
+                                maximum: 6,
+                            },
+                        },
+                        required: ["recipe_id"],
+                    },
+                    minItems: 1,
+                },
+            },
+            required: ["week_id", "meals"],
+        },
+    },
+    {
+        name: "get_recommended_extras",
+        description: "List meal-specific recommended extras/proteins for the currently selected meals in a week, or for a provided subset of selected meal recipe IDs.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+                recipe_ids: {
+                    type: "array",
+                    description: "Optional subset of currently selected meal recipe IDs to inspect",
+                    items: { type: "string" },
+                },
+            },
+            required: ["week_id"],
+        },
+    },
+    {
+        name: "preview_meal_extras",
+        description: "Preview explicit meal-specific extras for currently selected meals in a week without changing the account.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+                extras: {
+                    type: "array",
+                    description: "Exact extras to preview attaching to selected meals",
+                    items: {
+                        type: "object",
+                        properties: {
+                            addon_index: { type: "number", description: "Add-on index from get_recommended_extras" },
+                            meal_index: { type: "number", description: "Selected meal index this add-on should attach to" },
+                            meal_recipe_id: { type: "string", description: "Alternative to meal_index: selected meal recipe ID" },
+                            quantity: { type: "number", description: "Quantity to request", minimum: 1, maximum: 10 },
+                        },
+                        required: ["addon_index"],
+                    },
+                    minItems: 1,
+                },
+            },
+            required: ["week_id", "extras"],
         },
     },
     {
@@ -167,6 +310,127 @@ const TOOLS = [
                                 description: "Number of servings (optional)",
                                 minimum: 1,
                                 maximum: 6,
+                            },
+                        },
+                        required: ["recipe_id"],
+                    },
+                    minItems: 1,
+                },
+            },
+            required: ["week_id", "meals"],
+        },
+    },
+    {
+        name: "add_recommended_extras",
+        description: "Add HelloFresh's meal-specific recommended extras/proteins for the currently selected meals in a week.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+            },
+            required: ["week_id"],
+        },
+    },
+    {
+        name: "set_meal_extras",
+        description: "Apply explicit meal-specific extras to selected meals in a week using addon indexes from get_recommended_extras.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+                extras: {
+                    type: "array",
+                    description: "Exact extras to attach to selected meals",
+                    items: {
+                        type: "object",
+                        properties: {
+                            addon_index: { type: "number", description: "Add-on index from get_recommended_extras" },
+                            meal_index: { type: "number", description: "Selected meal index this add-on should attach to" },
+                            meal_recipe_id: { type: "string", description: "Alternative to meal_index: selected meal recipe ID" },
+                            quantity: { type: "number", description: "Quantity to request", minimum: 1, maximum: 10 },
+                        },
+                        required: ["addon_index"],
+                    },
+                    minItems: 1,
+                },
+            },
+            required: ["week_id", "extras"],
+        },
+    },
+    {
+        name: "apply_week_plan",
+        description: "Apply a complete stateless weekly plan: select meals with optional meal-bound extras.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+                meals: {
+                    type: "array",
+                    description: "Meals to select, each with optional extras attached to that meal",
+                    items: {
+                        type: "object",
+                        properties: {
+                            recipe_id: { type: "string", description: "Recipe ID to select" },
+                            servings: { type: "number", description: "Number of servings (optional)", minimum: 1, maximum: 6 },
+                            extras: {
+                                type: "array",
+                                description: "Optional extras attached to this selected meal",
+                                items: {
+                                    type: "object",
+                                    properties: {
+                                        addon_index: { type: "number", description: "Add-on index attached to this meal" },
+                                        quantity: { type: "number", description: "Quantity to request", minimum: 1, maximum: 10 },
+                                    },
+                                    required: ["addon_index"],
+                                },
+                            },
+                        },
+                        required: ["recipe_id"],
+                    },
+                    minItems: 1,
+                },
+            },
+            required: ["week_id", "meals"],
+        },
+    },
+    {
+        name: "preview_week_plan",
+        description: "Preview a complete stateless weekly plan: meal selection with optional meal-bound extras, without changing the account.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                week_id: {
+                    type: "string",
+                    description: "The week identifier (e.g. '2024-W01') for the delivery",
+                },
+                meals: {
+                    type: "array",
+                    description: "Meals to select, each with optional extras attached to that meal",
+                    items: {
+                        type: "object",
+                        properties: {
+                            recipe_id: { type: "string", description: "Recipe ID to select" },
+                            servings: { type: "number", description: "Number of servings (optional)", minimum: 1, maximum: 6 },
+                            extras: {
+                                type: "array",
+                                description: "Optional extras attached to this selected meal",
+                                items: {
+                                    type: "object",
+                                    properties: {
+                                        addon_index: { type: "number", description: "Add-on index attached to this meal" },
+                                        quantity: { type: "number", description: "Quantity to request", minimum: 1, maximum: 10 },
+                                    },
+                                    required: ["addon_index"],
+                                },
                             },
                         },
                         required: ["recipe_id"],
@@ -333,14 +597,33 @@ const TOOLS = [
         },
     },
 ];
+const MUTATING_TOOL_NAMES = new Set([
+    "select_meals",
+    "add_recommended_extras",
+    "set_meal_extras",
+    "apply_week_plan",
+    "skip_week",
+    "modify_delivery",
+    "update_preferences",
+    "modify_subscription",
+    "rate_recipe",
+]);
 // ─── Server Setup ─────────────────────────────────────────────────────────────
 class HelloFreshMCPServer {
     server;
     hellofresh;
     initialized = false;
+    readOnly;
     constructor() {
         this.server = new index_js_1.Server({ name: "@striderlabs/mcp-hellofresh", version: "1.0.0" }, { capabilities: { tools: {} } });
-        this.hellofresh = new browser_js_1.HelloFreshBrowser();
+        this.hellofresh = new browser_js_1.HelloFreshBrowser({
+            baseUrl: process.env.HELLOFRESH_BASE_URL,
+            country: process.env.HELLOFRESH_COUNTRY,
+            locale: process.env.HELLOFRESH_LOCALE,
+            sessionPath: process.env.HELLOFRESH_SESSION_PATH,
+            headless: process.env.HELLOFRESH_HEADLESS !== "false",
+        });
+        this.readOnly = process.env.HELLOFRESH_READ_ONLY !== "false";
         this.setupHandlers();
     }
     async ensureInitialized() {
@@ -351,18 +634,22 @@ class HelloFreshMCPServer {
                 throw new Error("HELLOFRESH_EMAIL and HELLOFRESH_PASSWORD environment variables are required.");
             }
             const credentials = { email, password };
-            await this.hellofresh.init();
             await this.hellofresh.login(credentials);
             this.initialized = true;
         }
     }
     setupHandlers() {
         this.server.setRequestHandler(types_js_1.ListToolsRequestSchema, async () => ({
-            tools: TOOLS,
+            tools: this.readOnly
+                ? TOOLS.filter((tool) => !MUTATING_TOOL_NAMES.has(tool.name))
+                : TOOLS,
         }));
         this.server.setRequestHandler(types_js_1.CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
             try {
+                if (this.readOnly && MUTATING_TOOL_NAMES.has(name)) {
+                    throw new Error(`Tool ${name} is disabled because HELLOFRESH_READ_ONLY is enabled.`);
+                }
                 await this.ensureInitialized();
                 return await this.handleTool(name, args ?? {});
             }
@@ -394,9 +681,87 @@ class HelloFreshMCPServer {
                 const details = await this.hellofresh.getRecipeDetails(params.recipe_id);
                 return text(details);
             }
+            case "get_menu_for_week": {
+                const params = GetMenuForWeekSchema.parse(args);
+                const menu = await this.hellofresh.getMenuForWeek(params.week_id);
+                return text({
+                    week_id: params.week_id,
+                    recipe_count: menu.length,
+                    recipes: menu,
+                });
+            }
+            case "get_recommended_extras": {
+                const params = GetRecommendedExtrasSchema.parse(args);
+                const result = await this.hellofresh.getRecommendedExtras(params.week_id, params.recipe_ids);
+                return text({
+                    week_id: params.week_id,
+                    meal_count: result.length,
+                    recommendations: result,
+                });
+            }
+            case "preview_meal_extras": {
+                const params = PreviewMealExtrasSchema.parse(args);
+                const result = await this.hellofresh.previewMealExtras(params.week_id, params.extras.map((extra) => ({
+                    addonIndex: extra.addon_index,
+                    mealIndex: extra.meal_index,
+                    mealRecipeId: extra.meal_recipe_id,
+                    quantity: extra.quantity,
+                })));
+                return text(result);
+            }
+            case "preview_select_meals": {
+                const params = PreviewSelectMealsSchema.parse(args);
+                const result = await this.hellofresh.previewSelectMeals(params.week_id, params.meals.map((m) => ({ recipeId: m.recipe_id, servings: m.servings })));
+                return text(result);
+            }
             case "select_meals": {
                 const params = SelectMealsSchema.parse(args);
                 const result = await this.hellofresh.selectMeals(params.week_id, params.meals.map((m) => ({ recipeId: m.recipe_id, servings: m.servings })));
+                return text(result);
+            }
+            case "add_recommended_extras": {
+                const params = AddRecommendedExtrasSchema.parse(args);
+                const result = await this.hellofresh.addRecommendedExtras(params.week_id);
+                return text(result);
+            }
+            case "set_meal_extras": {
+                const params = SetMealExtrasSchema.parse(args);
+                const result = await this.hellofresh.setMealExtras(params.week_id, params.extras.map((extra) => ({
+                    addonIndex: extra.addon_index,
+                    mealIndex: extra.meal_index,
+                    mealRecipeId: extra.meal_recipe_id,
+                    quantity: extra.quantity,
+                })));
+                return text(result);
+            }
+            case "preview_week_plan": {
+                const params = PreviewWeekPlanSchema.parse(args);
+                const result = await this.hellofresh.previewWeekPlan({
+                    weekId: params.week_id,
+                    meals: params.meals.map((meal) => ({
+                        recipeId: meal.recipe_id,
+                        servings: meal.servings,
+                        extras: meal.extras?.map((extra) => ({
+                            addonIndex: extra.addon_index,
+                            quantity: extra.quantity,
+                        })),
+                    })),
+                });
+                return text(result);
+            }
+            case "apply_week_plan": {
+                const params = ApplyWeekPlanSchema.parse(args);
+                const result = await this.hellofresh.applyWeekPlan({
+                    weekId: params.week_id,
+                    meals: params.meals.map((meal) => ({
+                        recipeId: meal.recipe_id,
+                        servings: meal.servings,
+                        extras: meal.extras?.map((extra) => ({
+                            addonIndex: extra.addon_index,
+                            quantity: extra.quantity,
+                        })),
+                    })),
+                });
                 return text(result);
             }
             case "skip_week": {
