@@ -9,6 +9,12 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test --max-warnings=0",
+    "test": "npm run build && node --test test/browser.test.js test/index.test.js",
+    "test:live": "npm run build && node --test test/live.test.js",
+    "verify": "npm run lint && npm run test",
+    "verify:live": "npm run lint && npm run test && npm run test:live",
     "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
     "pack": "npm pack",
@@ -32,6 +38,10 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.60.0",
+    "@typescript-eslint/parser": "^8.60.0",
+    "eslint": "^8.57.1",
+    "globals": "^17.6.0",
     "typescript": "^5.3.2"
   },
   "files": [

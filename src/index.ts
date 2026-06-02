@@ -5,10 +5,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  Tool,
+  type Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { HelloFreshBrowser, HelloFreshCredentials } from "./browser.js";
+import { HelloFreshBrowser, type HelloFreshCredentials, type WeekMenuMeal } from "./browser.js";
 
 // ─── Schemas ──────────────────────────────────────────────────────────────────
 
@@ -666,7 +666,36 @@ const MUTATING_TOOL_NAMES = new Set([
 
 // ─── Server Setup ─────────────────────────────────────────────────────────────
 
-class HelloFreshMCPServer {
+export function compactWeekMenuResponse(weekId: string, menu: WeekMenuMeal[]): {
+  week_id: string;
+  recipe_count: number;
+  recipes: Array<{
+    recipe_id: string;
+    menu_index: number;
+    name: string;
+    nutrition_per_serving: WeekMenuMeal["nutritionPerServing"] | null;
+    selected: boolean;
+    servings: number;
+    cooking_time_minutes: number;
+  }>;
+} {
+  const recipes = menu.map((meal) => ({
+    recipe_id: meal.id,
+    menu_index: meal.menuIndex,
+    name: meal.name,
+    nutrition_per_serving: meal.nutritionPerServing ?? null,
+    selected: meal.selected,
+    servings: meal.servings,
+    cooking_time_minutes: meal.totalTime,
+  }));
+  return {
+    week_id: weekId,
+    recipe_count: recipes.length,
+    recipes,
+  };
+}
+
+export class HelloFreshMCPServer {
   private server: Server;
   private hellofresh: HelloFreshBrowser;
   private initialized = false;
@@ -761,11 +790,7 @@ class HelloFreshMCPServer {
       case "get_menu_for_week": {
         const params = GetMenuForWeekSchema.parse(args);
         const menu = await this.hellofresh.getMenuForWeek(params.week_id);
-        return text({
-          week_id: params.week_id,
-          recipe_count: menu.length,
-          recipes: menu,
-        });
+        return text(compactWeekMenuResponse(params.week_id, menu));
       }
 
       case "get_recommended_extras": {
@@ -963,5 +988,7 @@ class HelloFreshMCPServer {
   }
 }
 
-const server = new HelloFreshMCPServer();
-server.run().catch(console.error);
+if (require.main === module) {
+  const server = new HelloFreshMCPServer();
+  server.run().catch(console.error);
+}

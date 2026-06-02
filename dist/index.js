@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.HelloFreshMCPServer = void 0;
+exports.compactWeekMenuResponse = compactWeekMenuResponse;
 const index_js_1 = require("@modelcontextprotocol/sdk/server/index.js");
 const stdio_js_1 = require("@modelcontextprotocol/sdk/server/stdio.js");
 const types_js_1 = require("@modelcontextprotocol/sdk/types.js");
@@ -609,6 +611,22 @@ const MUTATING_TOOL_NAMES = new Set([
     "rate_recipe",
 ]);
 // ─── Server Setup ─────────────────────────────────────────────────────────────
+function compactWeekMenuResponse(weekId, menu) {
+    const recipes = menu.map((meal) => ({
+        recipe_id: meal.id,
+        menu_index: meal.menuIndex,
+        name: meal.name,
+        nutrition_per_serving: meal.nutritionPerServing ?? null,
+        selected: meal.selected,
+        servings: meal.servings,
+        cooking_time_minutes: meal.totalTime,
+    }));
+    return {
+        week_id: weekId,
+        recipe_count: recipes.length,
+        recipes,
+    };
+}
 class HelloFreshMCPServer {
     server;
     hellofresh;
@@ -684,11 +702,7 @@ class HelloFreshMCPServer {
             case "get_menu_for_week": {
                 const params = GetMenuForWeekSchema.parse(args);
                 const menu = await this.hellofresh.getMenuForWeek(params.week_id);
-                return text({
-                    week_id: params.week_id,
-                    recipe_count: menu.length,
-                    recipes: menu,
-                });
+                return text(compactWeekMenuResponse(params.week_id, menu));
             }
             case "get_recommended_extras": {
                 const params = GetRecommendedExtrasSchema.parse(args);
@@ -841,6 +855,9 @@ class HelloFreshMCPServer {
         });
     }
 }
-const server = new HelloFreshMCPServer();
-server.run().catch(console.error);
+exports.HelloFreshMCPServer = HelloFreshMCPServer;
+if (require.main === module) {
+    const server = new HelloFreshMCPServer();
+    server.run().catch(console.error);
+}
 //# sourceMappingURL=index.js.map

@@ -21,6 +21,7 @@ class HelloFreshBrowser {
     locale;
     headless;
     sessionPath;
+    apiTimeoutMs;
     apiSession = null;
     constructor(options = {}) {
         this.baseUrl = HelloFreshBrowser.normalizeBaseUrl(options.baseUrl ?? HelloFreshBrowser.baseUrlForCountry(options.country));
@@ -29,27 +30,32 @@ class HelloFreshBrowser {
         this.headless = options.headless ?? true;
         this.sessionPath =
             options.sessionPath ?? (0, node_path_1.join)((0, node_os_1.homedir)(), ".config", "mcp-hellofresh", `${this.country.toLowerCase()}-session.json`);
+        this.apiTimeoutMs = Math.max(1_000, options.apiTimeoutMs ?? 15_000);
     }
     async init() {
-        if (this.browser && this.context && this.page)
-            return;
-        const launchOptions = {
-            headless: this.headless,
-            args: ["--no-sandbox", "--disable-setuid-sandbox"],
-        };
-        try {
-            this.browser = await playwright_extra_1.chromium.launch(launchOptions);
+        if (!this.browser) {
+            const launchOptions = {
+                headless: this.headless,
+                args: ["--no-sandbox", "--disable-setuid-sandbox"],
+            };
+            try {
+                this.browser = await playwright_extra_1.chromium.launch(launchOptions);
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                throw new Error(`Unable to launch Playwright Chromium. Run "npx playwright install chromium" before starting this MCP. ${message}`);
+            }
         }
-        catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            throw new Error(`Unable to launch Playwright Chromium. Run \"npx playwright install chromium\" before starting this MCP. ${message}`);
+        if (!this.context) {
+            this.context = await this.browser.newContext({
+                userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport: { width: 1280, height: 720 },
+                locale: this.locale,
+            });
         }
-        this.context = await this.browser.newContext({
-            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport: { width: 1280, height: 720 },
-            locale: this.locale,
-        });
-        this.page = await this.context.newPage();
+        if (!this.page) {
+            this.page = await this.context.newPage();
+        }
     }
     async login(credentials) {
         const storedSession = await this.loadSession();
@@ -57,13 +63,40 @@ class HelloFreshBrowser {
             this.isLoggedIn = true;
             return;
         }
-        await this.init();
-        const page = this.page;
+        let lastError = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            try {
+                await this.init();
+                const page = await this.ensurePage();
+                await this.performInteractiveLogin(page, credentials);
+                this.loginLandingUrl = page.url();
+                await this.captureBrowserSession();
+                this.isLoggedIn = true;
+                return;
+            }
+            catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+                if (!this.isTransientLoginError(lastError) || attempt === 1) {
+                    throw lastError;
+                }
+                await this.close();
+            }
+        }
+        throw lastError ?? new Error(`Login failed for ${this.baseUrl}.`);
+    }
+    async performInteractiveLogin(page, credentials) {
         await page.goto(`${this.baseUrl}/login`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         await this.acceptCookiesIfPresent(page);
-        await page.locator('input[type="email"], input[name="username"], input[name="email"], input[id*="email"], input[id*="username"]').first().fill(credentials.email);
-        const passwordInput = page.locator('input[type="password"], input[name="password"], input[id*="password"]').first();
+        const emailInput = page
+            .locator('input[type="email"], input[name="username"], input[name="email"], input[id*="email"], input[id*="username"]')
+            .first();
+        const passwordInput = page
+            .locator('input[type="password"], input[name="password"], input[id*="password"]')
+            .first();
+        await this.waitForEditableLocator(emailInput, "email");
+        await emailInput.fill(credentials.email);
+        await this.waitForEditableLocator(passwordInput, "password");
         await passwordInput.fill(credentials.password);
         await Promise.all([
             page.waitForURL((url) => !url.pathname.includes("/login"), { timeout: 20_000 }).catch(() => null),
@@ -79,9 +112,20 @@ class HelloFreshBrowser {
             const errorMsg = await this.extractLoginError(page);
             throw new Error(`Login failed for ${this.baseUrl}: ${errorMsg}`);
         }
-        this.loginLandingUrl = page.url();
-        await this.captureBrowserSession();
-        this.isLoggedIn = true;
+    }
+    async waitForEditableLocator(locator, label) {
+        await locator.waitFor({ state: "visible", timeout: 30_000 });
+        const deadline = Date.now() + 30_000;
+        while (Date.now() < deadline) {
+            const disabled = await locator.isDisabled().catch(() => true);
+            if (!disabled)
+                return;
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        throw new Error(`HelloFresh login ${label} field did not become editable.`);
+    }
+    isTransientLoginError(error) {
+        return /page crashed|err_insufficient_resources|did not become editable|timeout/i.test(error.message);
     }
     async getMenu(weekOffset = 0) {
         await this.ensureLoggedIn();
@@ -97,7 +141,7 @@ class HelloFreshBrowser {
         catch {
             // Fall back to page scraping below; some countries expose different API shapes.
         }
-        const page = this.page;
+        const page = await this.ensurePage();
         const target = this.loginLandingUrl?.includes("/my-account/deliveries/menu")
             ? this.loginLandingUrl
             : `${this.baseUrl}/my-account/deliveries/menu`;
@@ -107,114 +151,109 @@ class HelloFreshBrowser {
     }
     async getRecipeDetails(recipeId) {
         await this.ensureLoggedIn();
-        const page = this.page;
-        const menuRecipes = await this.getMenu(0).catch(() => []);
-        const menuRecipe = menuRecipes.find((recipe) => recipe.id === recipeId);
-        await page.goto(`${this.baseUrl}/recipes/${recipeId}`, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
-        const details = await page.evaluate(() => {
-            const text = (selector) => document.querySelector(selector)?.textContent?.trim() ?? "";
-            const texts = (selector) => Array.from(document.querySelectorAll(selector))
-                .map((el) => el.textContent?.trim() ?? "")
-                .filter(Boolean);
-            const nutritionData = {};
-            document
-                .querySelectorAll("[data-testid*='nutrition'] tr, [class*='Nutrition'] tr, [class*='nutrition'] tr")
-                .forEach((el) => {
-                const label = el.querySelector("td:first-child, th")?.textContent?.trim().toLowerCase() ?? "";
-                const value = Number.parseFloat(el.querySelector("td:last-child")?.textContent ?? "0");
-                if (!Number.isFinite(value))
-                    return;
-                if (label.includes("calorie") || label.includes("energy") || label.includes("kcal"))
-                    nutritionData.calories = value;
-                else if (label.includes("fat") && !label.includes("saturated"))
-                    nutritionData.fat = value;
-                else if (label.includes("saturated"))
-                    nutritionData.saturatedFat = value;
-                else if (label.includes("carb"))
-                    nutritionData.carbohydrates = value;
-                else if (label.includes("sugar"))
-                    nutritionData.sugar = value;
-                else if (label.includes("protein"))
-                    nutritionData.protein = value;
-                else if (label.includes("fiber"))
-                    nutritionData.fiber = value;
-                else if (label.includes("sodium") || label.includes("salt"))
-                    nutritionData.sodium = value;
+        const errors = [];
+        let apiDetails = null;
+        try {
+            const match = await this.findRecipeInMenus(recipeId);
+            if (match) {
+                apiDetails = this.recipeDetailsFromMenuRecipe(recipeId, match.recipe, match.meal);
+                if (this.hasMeaningfulRecipeDetails(apiDetails)) {
+                    return apiDetails;
+                }
+                errors.push(`menu API details were incomplete for recipe ${recipeId}`);
+            }
+            else {
+                errors.push(`recipe ${recipeId} was not found in accessible menu API data`);
+            }
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`menu API lookup failed: ${message}`);
+        }
+        try {
+            const page = await this.ensurePage();
+            await page.goto(`${this.baseUrl}/recipes/${recipeId}`, { waitUntil: "domcontentloaded" });
+            await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+            const scraped = await page.evaluate(() => {
+                const text = (selector) => document.querySelector(selector)?.textContent?.trim() ?? "";
+                const texts = (selector) => Array.from(document.querySelectorAll(selector))
+                    .map((el) => el.textContent?.trim() ?? "")
+                    .filter(Boolean);
+                const nutritionData = {};
+                document
+                    .querySelectorAll("[data-testid*='nutrition'] tr, [class*='Nutrition'] tr, [class*='nutrition'] tr")
+                    .forEach((el) => {
+                    const label = el.querySelector("td:first-child, th")?.textContent?.trim().toLowerCase() ?? "";
+                    const value = Number.parseFloat(el.querySelector("td:last-child")?.textContent ?? "0");
+                    if (!Number.isFinite(value))
+                        return;
+                    if (label.includes("calorie") || label.includes("energy") || label.includes("kcal"))
+                        nutritionData.calories = value;
+                    else if (label.includes("fat") && !label.includes("saturated"))
+                        nutritionData.fat = value;
+                    else if (label.includes("saturated"))
+                        nutritionData.saturatedFat = value;
+                    else if (label.includes("carb"))
+                        nutritionData.carbohydrates = value;
+                    else if (label.includes("sugar"))
+                        nutritionData.sugar = value;
+                    else if (label.includes("protein"))
+                        nutritionData.protein = value;
+                    else if (label.includes("fiber"))
+                        nutritionData.fiber = value;
+                    else if (label.includes("sodium") || label.includes("salt"))
+                        nutritionData.sodium = value;
+                });
+                return {
+                    name: text("h1, [data-testid='recipe-title'], [class*='RecipeTitle']"),
+                    description: text("[data-testid='recipe-description'], [class*='Description']"),
+                    ingredients: Array.from(document.querySelectorAll("[data-testid*='ingredient'], [class*='Ingredient'], .ingredient")).map((el) => ({
+                        name: el.querySelector("[class*='name'], .name")?.textContent?.trim() || el.textContent?.trim() || "",
+                        amount: el.querySelector("[class*='amount'], .amount")?.textContent?.trim() || "",
+                        unit: el.querySelector("[class*='unit'], .unit")?.textContent?.trim() || "",
+                    })),
+                    instructions: texts("[data-testid*='instruction'], [class*='Step'], .step"),
+                    nutrition: nutritionData,
+                    allergens: texts("[data-testid*='allergen'], [class*='Allergen'], [class*='allergen']"),
+                    tags: texts("[data-testid*='recipe-tag'], [class*='Tag'], [class*='badge']"),
+                    totalTime: Number.parseInt(text("[class*='time'], [data-testid*='time']"), 10) || undefined,
+                    difficulty: text("[class*='difficulty']"),
+                };
             });
-            return {
-                name: text("h1, [data-testid='recipe-title'], [class*='RecipeTitle']"),
-                description: text("[data-testid='recipe-description'], [class*='Description']"),
-                ingredients: Array.from(document.querySelectorAll("[data-testid*='ingredient'], [class*='Ingredient'], .ingredient")).map((el) => ({
-                    name: el.querySelector("[class*='name'], .name")?.textContent?.trim() || el.textContent?.trim() || "",
-                    amount: el.querySelector("[class*='amount'], .amount")?.textContent?.trim() || "",
-                    unit: el.querySelector("[class*='unit'], .unit")?.textContent?.trim() || "",
-                })),
-                instructions: texts("[data-testid*='instruction'], [class*='Step'], .step"),
-                nutrition: nutritionData,
-                allergens: texts("[data-testid*='allergen'], [class*='Allergen'], [class*='allergen']"),
-                tags: texts("[data-testid*='recipe-tag'], [class*='Tag'], [class*='badge']"),
-                totalTime: Number.parseInt(text("[class*='time'], [data-testid*='time']"), 10) || undefined,
-                difficulty: text("[class*='difficulty']"),
-            };
-        });
-        const base = menuRecipe ?? {
-            id: recipeId,
-            name: details.name || recipeId,
-            description: details.description || "",
-            prepTime: 10,
-            cookTime: 30,
-            totalTime: details.totalTime ?? 40,
-            difficulty: details.difficulty || "Medium",
-            calories: details.nutrition.calories || 0,
-            servings: 2,
-            tags: details.tags,
-        };
-        return {
-            ...base,
-            name: details.name || base.name,
-            description: details.description || base.description,
-            totalTime: details.totalTime ?? base.totalTime,
-            cookTime: Math.max((details.totalTime ?? base.totalTime) - base.prepTime, 0),
-            difficulty: details.difficulty || base.difficulty,
-            calories: details.nutrition.calories || base.calories,
-            ingredients: details.ingredients,
-            instructions: details.instructions,
-            nutrition: {
-                calories: details.nutrition.calories || base.calories,
-                fat: details.nutrition.fat || 0,
-                saturatedFat: details.nutrition.saturatedFat || 0,
-                carbohydrates: details.nutrition.carbohydrates || 0,
-                sugar: details.nutrition.sugar || 0,
-                protein: details.nutrition.protein || 0,
-                fiber: details.nutrition.fiber || 0,
-                sodium: details.nutrition.sodium || 0,
-            },
-            allergens: details.allergens,
-            utensils: [],
-        };
+            return this.mergeScrapedRecipeDetails(recipeId, scraped, apiDetails);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`page fallback failed: ${message}`);
+        }
+        throw new Error(`Unable to load recipe details for ${recipeId}. ${errors.join(" | ")}`);
     }
     async getDeliverySchedule() {
         await this.ensureLoggedIn();
         try {
             const deliveries = await this.getDeliveryRecords(12);
-            return deliveries.map((delivery) => ({
-                weekId: HelloFreshBrowser.stringValue(delivery.id),
-                deliveryDate: HelloFreshBrowser.stringValue(delivery.deliveryDate),
-                status: HelloFreshBrowser.stringValue(delivery.status || delivery.state || "Scheduled"),
-                meals: HelloFreshBrowser.asArray(delivery.recipes ?? delivery.meals).map((meal) => {
-                    const recipe = HelloFreshBrowser.recordValue(meal.recipe) ?? meal;
-                    return {
-                        recipeId: HelloFreshBrowser.stringValue(recipe.id ?? meal.recipeId),
-                        recipeName: HelloFreshBrowser.stringValue(recipe.name ?? meal.recipeName),
-                        servings: HelloFreshBrowser.numberValue(meal.servings, 2),
-                    };
-                }),
-                canModify: Boolean(HelloFreshBrowser.recordValue(delivery.allowedActions)?.mealSwap ?? delivery.actionable),
-            }));
+            let subscription = null;
+            const normalized = [];
+            for (const delivery of deliveries) {
+                const info = this.normalizeDeliveryRecord(delivery);
+                if (info.weekId && info.meals.length === 0 && this.deliveryNeedsMenuLookup(info)) {
+                    subscription ??= await this.getPrimarySubscriptionRecord();
+                    const menu = await this.apiGet(this.buildMenuApiPath(subscription, info.weekId));
+                    const selectedMeals = this.selectedMealsFromMenu(menu);
+                    if (selectedMeals.length > 0) {
+                        info.meals = selectedMeals;
+                    }
+                }
+                normalized.push(info);
+            }
+            return normalized;
         }
-        catch {
-            return this.scrapeDeliveryScheduleFromCurrentPage();
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (message.includes("timed out")) {
+                throw error;
+            }
+            return this.scrapeDeliveryScheduleFromCurrentPage(8_000);
         }
     }
     async getMenuForWeek(weekId) {
@@ -455,7 +494,7 @@ class HelloFreshBrowser {
     }
     async skipWeek(weekId) {
         await this.ensureLoggedIn();
-        const page = this.page;
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/my-account/deliveries?week=${encodeURIComponent(weekId)}`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         const weekEl = page.locator(`[data-week="${weekId}"], [data-delivery-id="${weekId}"], text=${weekId}`).first();
@@ -478,7 +517,7 @@ class HelloFreshBrowser {
     }
     async modifyDelivery(weekId, newDate) {
         await this.ensureLoggedIn();
-        const page = this.page;
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/my-account/deliveries?week=${encodeURIComponent(weekId)}`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         const modifyBtn = page.locator('button:has-text("Modify"), button:has-text("Change"), button:has-text("Wijzig"), button:has-text("Aanpassen"), [data-testid*="modify"]').first();
@@ -505,41 +544,83 @@ class HelloFreshBrowser {
     }
     async getPreferences() {
         await this.ensureLoggedIn();
-        const page = this.page;
-        await page.goto(`${this.baseUrl}/my-account/preferences`, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
-        return page.evaluate(() => {
-            const checkedPrefs = Array.from(document.querySelectorAll('input[type="checkbox"]:checked, [data-testid*="preference"][aria-checked="true"]')).map((el) => el.getAttribute("value") ||
-                el.getAttribute("name") ||
-                el.value ||
-                "");
-            const lower = checkedPrefs.map((pref) => pref.toLowerCase());
-            return {
-                dietaryPreferences: checkedPrefs.filter((pref) => !pref.toLowerCase().includes("allergen") && !pref.toLowerCase().includes("cuisine")),
-                allergens: checkedPrefs.filter((pref) => pref.toLowerCase().includes("allergen")),
-                cuisinePreferences: checkedPrefs.filter((pref) => pref.toLowerCase().includes("cuisine")),
-                familyFriendly: lower.some((pref) => pref.includes("family") || pref.includes("familie")),
-                vegetarian: lower.some((pref) => pref.includes("vegetarian") || pref.includes("veggie") || pref.includes("vegetar")),
-            };
-        });
+        const errors = [];
+        try {
+            const records = await this.loadPreferenceApiRecords();
+            const preferences = this.preferencesFromApiRecords(records);
+            if (preferences) {
+                return preferences;
+            }
+            errors.push("authenticated API did not expose recognizable preference fields");
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`API lookup failed: ${message}`);
+        }
+        try {
+            const preferences = await this.scrapePreferencesFromPage();
+            if (preferences) {
+                return preferences;
+            }
+            errors.push("preferences page did not expose recognizable preference controls");
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            errors.push(`page fallback failed: ${message}`);
+        }
+        throw new Error(`HelloFresh preferences are not exposed for this account or region. ${errors.join(" | ")}`);
     }
     async updatePreferences(preferences) {
         await this.ensureLoggedIn();
-        const page = this.page;
+        const requestedFields = Object.entries(preferences)
+            .filter(([, value]) => value !== undefined)
+            .map(([key]) => key);
+        if (requestedFields.length === 0) {
+            return { success: false, message: "No preference changes were requested." };
+        }
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/my-account/preferences`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+        let handledControls = 0;
+        let changedControls = 0;
         if (preferences.vegetarian !== undefined) {
-            await this.setCheckboxByLocator(page.locator('input[value*="vegetarian"], input[value*="veggie"], [data-testid*="vegetarian"], [data-testid*="veggie"]').first(), preferences.vegetarian);
+            const result = await this.setCheckboxByLocator(page.locator('input[value*="vegetarian"], input[value*="veggie"], [data-testid*="vegetarian"], [data-testid*="veggie"]').first(), preferences.vegetarian);
+            handledControls += Number(result.found);
+            changedControls += Number(result.changed);
         }
         if (preferences.familyFriendly !== undefined) {
-            await this.setCheckboxByLocator(page.locator('input[value*="family"], input[value*="familie"], [data-testid*="family"], [data-testid*="familie"]').first(), preferences.familyFriendly);
+            const result = await this.setCheckboxByLocator(page.locator('input[value*="family"], input[value*="familie"], [data-testid*="family"], [data-testid*="familie"]').first(), preferences.familyFriendly);
+            handledControls += Number(result.found);
+            changedControls += Number(result.changed);
+        }
+        const unsupportedFields = requestedFields.filter((field) => !["vegetarian", "familyFriendly"].includes(field));
+        if (handledControls === 0) {
+            return {
+                success: false,
+                message: `Could not find editable preference controls for requested fields: ${requestedFields.join(", ")}.`,
+            };
+        }
+        if (changedControls === 0 && unsupportedFields.length === 0) {
+            return {
+                success: true,
+                message: "Requested preference values already match the current page state.",
+            };
         }
         const saveBtn = page.locator('button:has-text("Save"), button:has-text("Opslaan"), button[type="submit"], [data-testid*="save-preferences"]').first();
-        if (await saveBtn.isVisible({ timeout: 3_000 }).catch(() => false)) {
-            await saveBtn.click();
-            await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+        if (!(await saveBtn.isVisible({ timeout: 3_000 }).catch(() => false))) {
+            return {
+                success: false,
+                message: `Preference controls were found, but no save action was available.${unsupportedFields.length > 0 ? ` Unsupported fields: ${unsupportedFields.join(", ")}.` : ""}`,
+            };
         }
-        return { success: true, message: "Preferences updated successfully." };
+        await saveBtn.click();
+        await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+        return {
+            success: unsupportedFields.length === 0,
+            message: unsupportedFields.length === 0
+                ? "Preferences updated successfully."
+                : `Updated supported preferences, but these fields were not editable here: ${unsupportedFields.join(", ")}.`,
+        };
     }
     async getSubscription() {
         await this.ensureLoggedIn();
@@ -568,7 +649,7 @@ class HelloFreshBrowser {
     }
     async modifySubscription(changes) {
         await this.ensureLoggedIn();
-        const page = this.page;
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/my-account/plan`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         let changed = false;
@@ -599,34 +680,49 @@ class HelloFreshBrowser {
         await this.ensureLoggedIn();
         try {
             const data = await this.apiGet(`/gw/api/customers/me/orders?country=${encodeURIComponent(this.country)}&limit=${encodeURIComponent(String(limit))}&locale=${encodeURIComponent(this.locale)}`);
-            return HelloFreshBrowser.asArray(data.items ?? data.orders)
-                .slice(0, limit)
-                .map((order) => {
-                const record = order;
-                return {
-                    orderId: HelloFreshBrowser.stringValue(record.id ?? record.orderId ?? record.incrementId),
-                    deliveryDate: HelloFreshBrowser.stringValue(record.deliveryDate ?? record.date),
-                    meals: HelloFreshBrowser.asArray(record.recipes ?? record.meals).map((meal) => {
-                        const mealRecord = meal;
-                        const recipe = HelloFreshBrowser.recordValue(mealRecord.recipe) ?? mealRecord;
-                        return {
-                            recipeId: HelloFreshBrowser.stringValue(recipe.id ?? mealRecord.recipeId),
-                            recipeName: HelloFreshBrowser.stringValue(recipe.name ?? mealRecord.recipeName),
-                            servings: HelloFreshBrowser.numberValue(mealRecord.servings, 2),
-                        };
-                    }),
-                    totalPrice: HelloFreshBrowser.numberValue(record.totalPrice ?? record.total ?? record.price, 0) / 100,
-                    status: HelloFreshBrowser.stringValue(record.status ?? "Delivered"),
-                };
-            });
+            const orders = [];
+            const incompleteOrders = [];
+            for (const order of HelloFreshBrowser.asArray(data.items ?? data.orders).slice(0, limit)) {
+                const summary = HelloFreshBrowser.recordValue(order) ?? {};
+                let normalized = this.normalizeOrderRecord(summary);
+                if ((!normalized.deliveryDate || normalized.meals.length === 0) && normalized.orderId) {
+                    try {
+                        const detailResponse = await this.getOrderDetailRecord(normalized.orderId);
+                        const detail = HelloFreshBrowser.recordValue(detailResponse.item ?? detailResponse.order) ?? detailResponse;
+                        normalized = this.normalizeOrderRecord({ ...summary, ...detail });
+                    }
+                    catch {
+                        // Keep the summary result and assess completeness below.
+                    }
+                }
+                if (!normalized.deliveryDate || normalized.meals.length === 0) {
+                    incompleteOrders.push(normalized.orderId || "<unknown>");
+                }
+                orders.push(normalized);
+            }
+            if (orders.length > 0 && incompleteOrders.length === orders.length) {
+                throw new Error(`HelloFresh orders API returned partial data for all requested orders even after detail lookups: ${incompleteOrders.join(", ")}`);
+            }
+            return orders;
         }
-        catch {
-            return this.scrapePastOrdersFromCurrentPage(limit);
+        catch (error) {
+            const original = error instanceof Error ? error : new Error(String(error));
+            try {
+                const scraped = await this.scrapePastOrdersFromCurrentPage(limit);
+                if (scraped.some((order) => order.deliveryDate || order.meals.length > 0)) {
+                    return scraped;
+                }
+            }
+            catch (fallbackError) {
+                const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+                throw new Error(`${original.message} | page fallback failed: ${fallbackMessage}`);
+            }
+            throw original;
         }
     }
     async rateRecipe(recipeId, rating, comment) {
         await this.ensureLoggedIn();
-        const page = this.page;
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/recipes/${recipeId}`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         const starBtn = page.locator(`[data-rating="${rating}"], [aria-label*="${rating} star"], [aria-label*="${rating} ster"], .star:nth-child(${rating})`).first();
@@ -674,6 +770,36 @@ class HelloFreshBrowser {
             throw new Error("Not logged in. Please provide HELLOFRESH_EMAIL and HELLOFRESH_PASSWORD environment variables.");
         }
     }
+    async ensurePage() {
+        if (!this.browser || !this.context || !this.page) {
+            await this.init();
+        }
+        if (!this.context || !this.page) {
+            throw new Error("HelloFresh browser page is not initialized.");
+        }
+        if (this.apiSession?.cookies.length) {
+            await this.hydrateContextCookies(this.context, this.apiSession.cookies);
+        }
+        return this.page;
+    }
+    async hydrateContextCookies(context, cookies) {
+        const nowSeconds = Date.now() / 1000;
+        const secure = new URL(this.baseUrl).protocol === "https:";
+        const activeCookies = cookies
+            .filter((cookie) => !cookie.expires || cookie.expires < 0 || cookie.expires > nowSeconds)
+            .map((cookie) => ({
+            name: cookie.name,
+            value: cookie.value,
+            domain: cookie.domain,
+            path: cookie.path,
+            expires: cookie.expires,
+            httpOnly: false,
+            secure,
+        }));
+        if (activeCookies.length === 0)
+            return;
+        await context.addCookies(activeCookies);
+    }
     parseApiRecipes(apiRecipes) {
         return apiRecipes
             .map((entry) => {
@@ -705,6 +831,640 @@ class HelloFreshBrowser {
             };
         })
             .filter((recipe) => recipe.id && recipe.name);
+    }
+    async findRecipeInMenus(recipeId) {
+        const subscription = await this.getPrimarySubscriptionRecord();
+        const weeks = await this.recipeLookupWeeks(subscription);
+        for (const weekId of weeks) {
+            const menu = await this.apiGet(this.buildMenuApiPath(subscription, weekId));
+            const match = this.findRecipeInMenu(menu, recipeId);
+            if (match)
+                return match;
+        }
+        return null;
+    }
+    async recipeLookupWeeks(subscription) {
+        const weeks = new Set();
+        const addWeek = (value) => {
+            const week = HelloFreshBrowser.stringValue(value);
+            if (week)
+                weeks.add(week);
+        };
+        addWeek(subscription.nextModifiableDeliveryWeek);
+        addWeek(subscription.nextDeliveryWeek);
+        for (let offset = 0; offset <= 5; offset += 1) {
+            try {
+                addWeek(await this.getMenuWeek(subscription, offset));
+            }
+            catch {
+                // Ignore sparse menu-week lookups and continue with other candidates.
+            }
+        }
+        const deliveries = await this.getDeliveryRecords(12).catch(() => []);
+        for (const delivery of deliveries) {
+            addWeek(delivery.id ?? delivery.week ?? delivery.hfWeek ?? delivery.deliveryWeek);
+            const nestedDelivery = HelloFreshBrowser.recordValue(delivery.delivery);
+            addWeek(nestedDelivery?.id ?? nestedDelivery?.week);
+        }
+        return Array.from(weeks);
+    }
+    findRecipeInMenu(menu, recipeId) {
+        for (const item of HelloFreshBrowser.asArray(menu.meals ?? menu.recipes)) {
+            const meal = HelloFreshBrowser.recordValue(item);
+            if (!meal)
+                continue;
+            const recipe = HelloFreshBrowser.recordValue(meal.recipe) ?? meal;
+            const candidateIds = [
+                HelloFreshBrowser.stringValue(recipe.id),
+                HelloFreshBrowser.stringValue(meal.recipeId),
+                HelloFreshBrowser.stringValue(meal.id),
+            ];
+            if (candidateIds.includes(recipeId)) {
+                return meal === recipe ? { recipe } : { recipe, meal };
+            }
+        }
+        return null;
+    }
+    recipeDetailsFromMenuRecipe(recipeId, recipeRecord, mealRecord) {
+        const detailSource = mealRecord ? { ...mealRecord, recipe: recipeRecord } : recipeRecord;
+        const parsed = this.parseApiRecipes([detailSource])[0];
+        const nutrition = this.parseNutritionInfo(detailSource);
+        const base = parsed ?? {
+            id: recipeId,
+            name: HelloFreshBrowser.stringValue(recipeRecord.name || recipeId),
+            description: HelloFreshBrowser.stringValue(recipeRecord.headline ?? recipeRecord.description),
+            imageUrl: HelloFreshBrowser.optionalString(recipeRecord.image ?? recipeRecord.imageLink ?? recipeRecord.imageUrl),
+            prepTime: 10,
+            cookTime: 30,
+            totalTime: HelloFreshBrowser.durationMinutes(recipeRecord.totalTime ?? recipeRecord.prepTime) || 40,
+            difficulty: HelloFreshBrowser.stringValue((recipeRecord.difficulty ?? recipeRecord.difficultyLevel) || "Medium"),
+            calories: nutrition.calories,
+            servings: HelloFreshBrowser.numberValue(mealRecord?.servings ?? recipeRecord.yields, 2),
+            tags: this.recipeTags(recipeRecord),
+        };
+        return {
+            ...base,
+            id: recipeId,
+            calories: nutrition.calories || base.calories,
+            ingredients: this.parseIngredients(recipeRecord),
+            instructions: this.parseInstructions(recipeRecord),
+            nutrition: {
+                ...nutrition,
+                calories: nutrition.calories || base.calories,
+            },
+            allergens: this.parseAllergens(recipeRecord),
+            utensils: this.parseUtensils(recipeRecord),
+        };
+    }
+    mergeScrapedRecipeDetails(recipeId, scraped, base) {
+        const fallback = base ?? {
+            id: recipeId,
+            name: scraped.name || recipeId,
+            description: scraped.description || "",
+            prepTime: 10,
+            cookTime: 30,
+            totalTime: scraped.totalTime ?? 40,
+            difficulty: scraped.difficulty || "Medium",
+            calories: scraped.nutrition.calories || 0,
+            servings: 2,
+            tags: scraped.tags,
+            ingredients: [],
+            instructions: [],
+            nutrition: {
+                calories: 0,
+                fat: 0,
+                saturatedFat: 0,
+                carbohydrates: 0,
+                sugar: 0,
+                protein: 0,
+                fiber: 0,
+                sodium: 0,
+            },
+            allergens: [],
+            utensils: [],
+        };
+        return {
+            ...fallback,
+            name: scraped.name || fallback.name,
+            description: scraped.description || fallback.description,
+            totalTime: scraped.totalTime ?? fallback.totalTime,
+            cookTime: Math.max((scraped.totalTime ?? fallback.totalTime) - fallback.prepTime, 0),
+            difficulty: scraped.difficulty || fallback.difficulty,
+            calories: scraped.nutrition.calories || fallback.calories,
+            ingredients: scraped.ingredients.length > 0 ? scraped.ingredients : fallback.ingredients,
+            instructions: scraped.instructions.length > 0 ? scraped.instructions : fallback.instructions,
+            nutrition: {
+                calories: scraped.nutrition.calories || fallback.nutrition.calories || fallback.calories,
+                fat: scraped.nutrition.fat || fallback.nutrition.fat,
+                saturatedFat: scraped.nutrition.saturatedFat || fallback.nutrition.saturatedFat,
+                carbohydrates: scraped.nutrition.carbohydrates || fallback.nutrition.carbohydrates,
+                sugar: scraped.nutrition.sugar || fallback.nutrition.sugar,
+                protein: scraped.nutrition.protein || fallback.nutrition.protein,
+                fiber: scraped.nutrition.fiber || fallback.nutrition.fiber,
+                sodium: scraped.nutrition.sodium || fallback.nutrition.sodium,
+            },
+            allergens: scraped.allergens.length > 0 ? scraped.allergens : fallback.allergens,
+        };
+    }
+    hasMeaningfulRecipeDetails(details) {
+        return (details.ingredients.length > 0 ||
+            details.instructions.length > 0 ||
+            details.allergens.length > 0 ||
+            Object.values(details.nutrition).some((value) => value > 0));
+    }
+    recipeTags(recipeRecord) {
+        return HelloFreshBrowser.asArray(recipeRecord.tags)
+            .map((tag) => HelloFreshBrowser.stringValue(HelloFreshBrowser.recordValue(tag)?.name ?? tag))
+            .filter(Boolean);
+    }
+    parseNutritionInfo(record) {
+        const recipe = HelloFreshBrowser.recordValue(record.recipe) ?? record;
+        const nutrition = HelloFreshBrowser.recordValue(recipe.nutrition) ??
+            HelloFreshBrowser.recordValue(recipe.nutritionPerServing) ??
+            HelloFreshBrowser.recordValue(recipe.nutritionFacts) ??
+            HelloFreshBrowser.recordValue(recipe.nutritionalValues) ??
+            {};
+        const nutrientEntries = [
+            ...HelloFreshBrowser.asArray(nutrition.items),
+            ...HelloFreshBrowser.asArray(nutrition.values),
+            ...HelloFreshBrowser.asArray(nutrition.nutrients),
+            ...HelloFreshBrowser.asArray(recipe.nutrients),
+        ];
+        const nutrientValue = (aliases, directValues) => {
+            for (const value of directValues) {
+                const parsed = HelloFreshBrowser.maybeNumber(value);
+                if (parsed !== undefined)
+                    return parsed;
+            }
+            for (const entry of nutrientEntries) {
+                const row = HelloFreshBrowser.recordValue(entry);
+                if (!row)
+                    continue;
+                const label = HelloFreshBrowser.stringValue(row.label ?? row.name ?? row.key ?? row.code).toLowerCase();
+                if (!aliases.some((alias) => label.includes(alias)))
+                    continue;
+                const parsed = HelloFreshBrowser.maybeNumber(row.amount ?? row.value ?? row.quantity);
+                if (parsed !== undefined)
+                    return parsed;
+            }
+            return 0;
+        };
+        return {
+            calories: nutrientValue(["calorie", "energy", "kcal"], [
+                nutrition.calories,
+                nutrition.energyKcal,
+                nutrition.kcal,
+                recipe.calories,
+            ]),
+            fat: nutrientValue(["fat"], [nutrition.fat, nutrition.totalFat]),
+            saturatedFat: nutrientValue(["saturated"], [nutrition.saturatedFat, nutrition.saturates]),
+            carbohydrates: nutrientValue(["carb", "carbohydrate"], [
+                nutrition.carbohydrate,
+                nutrition.carbohydrates,
+                nutrition.carbs,
+            ]),
+            sugar: nutrientValue(["sugar"], [nutrition.sugar, nutrition.sugars]),
+            protein: nutrientValue(["protein"], [nutrition.protein]),
+            fiber: nutrientValue(["fiber", "fibre"], [nutrition.fiber, nutrition.fibre]),
+            sodium: nutrientValue(["sodium", "salt", "natrium"], [nutrition.sodium, nutrition.salt]),
+        };
+    }
+    parseIngredients(record) {
+        const recipe = HelloFreshBrowser.recordValue(record.recipe) ?? record;
+        const values = [
+            ...HelloFreshBrowser.asArray(recipe.ingredients),
+            ...HelloFreshBrowser.asArray(recipe.ingredientLines),
+            ...HelloFreshBrowser.asArray(recipe.ingredientsWithAlternatives),
+            ...HelloFreshBrowser.asArray(recipe.recipeIngredients),
+            ...HelloFreshBrowser.asArray(recipe.products),
+        ];
+        const seen = new Set();
+        const ingredients = [];
+        for (const value of values) {
+            if (typeof value === "string") {
+                const name = value.trim();
+                if (!name || seen.has(name))
+                    continue;
+                seen.add(name);
+                ingredients.push({ name, amount: "", unit: "" });
+                continue;
+            }
+            const entry = HelloFreshBrowser.recordValue(value);
+            if (!entry)
+                continue;
+            const ingredientRecord = HelloFreshBrowser.recordValue(entry.ingredient) ??
+                HelloFreshBrowser.recordValue(entry.product) ??
+                HelloFreshBrowser.recordValue(entry.item) ??
+                entry;
+            const name = HelloFreshBrowser.stringValue(ingredientRecord.name ??
+                ingredientRecord.displayName ??
+                ingredientRecord.title ??
+                entry.name ??
+                entry.title).trim();
+            if (!name)
+                continue;
+            const amountValue = entry.amount ??
+                entry.quantity ??
+                entry.value ??
+                ingredientRecord.amount ??
+                ingredientRecord.quantity;
+            const amount = HelloFreshBrowser.stringValue(amountValue).trim();
+            const unit = HelloFreshBrowser.stringValue(entry.unit ??
+                entry.unitName ??
+                ingredientRecord.unit ??
+                ingredientRecord.unitName).trim();
+            const key = `${name}|${amount}|${unit}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            ingredients.push({ name, amount, unit });
+        }
+        return ingredients;
+    }
+    parseInstructions(record) {
+        const recipe = HelloFreshBrowser.recordValue(record.recipe) ?? record;
+        const values = [
+            ...HelloFreshBrowser.asArray(recipe.instructions),
+            ...HelloFreshBrowser.asArray(recipe.steps),
+            ...HelloFreshBrowser.asArray(recipe.methodSteps),
+            ...HelloFreshBrowser.asArray(recipe.recipeInstructions),
+        ];
+        const steps = [];
+        const seen = new Set();
+        for (const value of values) {
+            const text = typeof value === "string"
+                ? value.trim()
+                : HelloFreshBrowser.stringValue(HelloFreshBrowser.recordValue(value)?.text ??
+                    HelloFreshBrowser.recordValue(value)?.description ??
+                    HelloFreshBrowser.recordValue(value)?.instruction ??
+                    HelloFreshBrowser.recordValue(value)?.body).trim();
+            if (!text || seen.has(text))
+                continue;
+            seen.add(text);
+            steps.push(text);
+        }
+        return steps;
+    }
+    parseAllergens(record) {
+        const recipe = HelloFreshBrowser.recordValue(record.recipe) ?? record;
+        const values = [
+            ...HelloFreshBrowser.asArray(recipe.allergens),
+            ...HelloFreshBrowser.asArray(recipe.allergenInformation),
+            ...HelloFreshBrowser.asArray(HelloFreshBrowser.recordValue(recipe.dietaryPreferences)?.allergens),
+        ];
+        return HelloFreshBrowser.uniqueStrings(values.map((value) => HelloFreshBrowser.stringValue(HelloFreshBrowser.recordValue(value)?.name ??
+            HelloFreshBrowser.recordValue(value)?.label ??
+            value)));
+    }
+    parseUtensils(record) {
+        const recipe = HelloFreshBrowser.recordValue(record.recipe) ?? record;
+        const values = [
+            ...HelloFreshBrowser.asArray(recipe.utensils),
+            ...HelloFreshBrowser.asArray(recipe.tools),
+            ...HelloFreshBrowser.asArray(recipe.equipment),
+        ];
+        return HelloFreshBrowser.uniqueStrings(values.map((value) => HelloFreshBrowser.stringValue(HelloFreshBrowser.recordValue(value)?.name ??
+            HelloFreshBrowser.recordValue(value)?.label ??
+            value)));
+    }
+    normalizeDeliveryRecord(record) {
+        const nestedDelivery = HelloFreshBrowser.recordValue(record.delivery);
+        const weekId = HelloFreshBrowser.stringValue(record.id ??
+            record.week ??
+            record.hfWeek ??
+            record.deliveryWeek ??
+            nestedDelivery?.id ??
+            nestedDelivery?.week ??
+            nestedDelivery?.hfWeek);
+        const deliveryDate = HelloFreshBrowser.stringValue(record.deliveryDate ??
+            record.delivery_date ??
+            record.date ??
+            record.deliveredAt ??
+            record.expectedDeliveryDate ??
+            nestedDelivery?.date ??
+            nestedDelivery?.deliveryDate ??
+            nestedDelivery?.expectedDeliveryDate);
+        const status = HelloFreshBrowser.stringValue(record.status ??
+            record.state ??
+            nestedDelivery?.status ??
+            nestedDelivery?.state ??
+            "Scheduled");
+        const meals = this.selectedMealsFromUnknownItems(record.recipes ??
+            record.meals ??
+            record.selectedMeals ??
+            record.lineItems ??
+            record.items ??
+            nestedDelivery?.recipes ??
+            nestedDelivery?.meals ??
+            nestedDelivery?.selectedMeals ??
+            nestedDelivery?.lineItems ??
+            nestedDelivery?.items);
+        return {
+            weekId,
+            deliveryDate,
+            status,
+            meals,
+            canModify: this.deliveryCanModify(record, status, deliveryDate),
+        };
+    }
+    deliveryNeedsMenuLookup(delivery) {
+        if (delivery.meals.length > 0 || !delivery.weekId)
+            return false;
+        if (!delivery.deliveryDate)
+            return !/delivered|cancelled|skipped/i.test(delivery.status);
+        const deliveryTime = Date.parse(delivery.deliveryDate);
+        return !Number.isFinite(deliveryTime) || deliveryTime >= Date.now();
+    }
+    deliveryCanModify(record, status, deliveryDate) {
+        const nestedDelivery = HelloFreshBrowser.recordValue(record.delivery);
+        const allowedActions = HelloFreshBrowser.recordValue(record.allowedActions) ??
+            HelloFreshBrowser.recordValue(nestedDelivery?.allowedActions);
+        if (typeof allowedActions?.mealSwap === "boolean")
+            return allowedActions.mealSwap;
+        const explicitActionable = record.actionable ??
+            record.modifiable ??
+            nestedDelivery?.actionable ??
+            nestedDelivery?.modifiable;
+        if (typeof explicitActionable === "boolean")
+            return explicitActionable;
+        if (/delivered|cancelled|canceled|skipped|paused/i.test(status))
+            return false;
+        const cutoffText = HelloFreshBrowser.stringValue(record.cutoffDate ??
+            record.cutoffDateTime ??
+            nestedDelivery?.cutoffDate ??
+            nestedDelivery?.cutoffDateTime);
+        if (cutoffText) {
+            const cutoffTime = Date.parse(cutoffText);
+            if (Number.isFinite(cutoffTime) && cutoffTime <= Date.now())
+                return false;
+        }
+        if (deliveryDate) {
+            const deliveryTime = Date.parse(deliveryDate);
+            if (Number.isFinite(deliveryTime) && deliveryTime <= Date.now())
+                return false;
+        }
+        return true;
+    }
+    normalizeOrderRecord(record) {
+        const nestedDelivery = HelloFreshBrowser.recordValue(record.delivery);
+        const orderId = HelloFreshBrowser.stringValue(record.id ??
+            record.orderId ??
+            record.incrementId ??
+            record.number ??
+            nestedDelivery?.id);
+        const deliveryDate = HelloFreshBrowser.stringValue(record.deliveryDate ??
+            record.delivery_date ??
+            record.date ??
+            record.deliveredAt ??
+            record.expectedDeliveryDate ??
+            nestedDelivery?.date ??
+            nestedDelivery?.deliveryDate ??
+            nestedDelivery?.expectedDeliveryDate);
+        return {
+            orderId,
+            deliveryDate,
+            meals: this.selectedMealsFromUnknownItems(record.recipes ??
+                record.meals ??
+                record.selectedMeals ??
+                record.lineItems ??
+                record.items ??
+                record.products ??
+                nestedDelivery?.recipes ??
+                nestedDelivery?.meals ??
+                nestedDelivery?.lineItems ??
+                nestedDelivery?.items),
+            totalPrice: this.normalizeCurrencyAmount(record.totalPrice ?? record.total ?? record.price ?? record.grandTotal),
+            status: HelloFreshBrowser.stringValue(record.status ?? record.state ?? nestedDelivery?.status ?? "Delivered"),
+        };
+    }
+    selectedMealsFromUnknownItems(value) {
+        const meals = [];
+        const seen = new Set();
+        for (const item of HelloFreshBrowser.asArray(value)) {
+            const record = HelloFreshBrowser.recordValue(item);
+            if (!record) {
+                const recipeName = HelloFreshBrowser.stringValue(item).trim();
+                if (!recipeName || seen.has(recipeName))
+                    continue;
+                seen.add(recipeName);
+                meals.push({ recipeId: "", recipeName, servings: 2 });
+                continue;
+            }
+            const product = HelloFreshBrowser.recordValue(record.product);
+            const source = HelloFreshBrowser.recordValue(record.recipe) ??
+                HelloFreshBrowser.recordValue(product?.recipe) ??
+                product ??
+                HelloFreshBrowser.recordValue(record.meal) ??
+                HelloFreshBrowser.recordValue(record.item) ??
+                record;
+            const recipeId = HelloFreshBrowser.stringValue(source.id ??
+                source.recipeId ??
+                record.recipeId ??
+                record.productId ??
+                record.sku);
+            const recipeName = HelloFreshBrowser.stringValue(source.name ??
+                source.title ??
+                record.recipeName ??
+                record.name ??
+                record.title).trim();
+            if (!recipeId && !recipeName)
+                continue;
+            const servings = HelloFreshBrowser.numberValue(record.servings ??
+                record.quantity ??
+                record.count ??
+                source.servings ??
+                source.quantity, 2);
+            const key = `${recipeId}|${recipeName}|${servings}`;
+            if (seen.has(key))
+                continue;
+            seen.add(key);
+            meals.push({ recipeId, recipeName, servings });
+        }
+        return meals;
+    }
+    async getOrderDetailRecord(orderId) {
+        const encoded = encodeURIComponent(orderId);
+        const paths = [
+            `/gw/api/customers/me/orders/${encoded}?country=${encodeURIComponent(this.country)}&locale=${encodeURIComponent(this.locale)}`,
+            `/gw/api/customers/me/orders/${encoded}?country=${encodeURIComponent(this.country)}`,
+            `/gw/api/customers/me/orders/${encoded}`,
+        ];
+        let lastError = null;
+        for (const path of paths) {
+            try {
+                return await this.apiGet(path);
+            }
+            catch (error) {
+                lastError = error instanceof Error ? error : new Error(String(error));
+            }
+        }
+        throw lastError ?? new Error(`HelloFresh order detail lookup failed for ${orderId}.`);
+    }
+    normalizeCurrencyAmount(value) {
+        const amount = HelloFreshBrowser.numberValue(value, 0);
+        return Number.isInteger(amount) && amount >= 100 ? amount / 100 : amount;
+    }
+    async loadPreferenceApiRecords() {
+        const records = [];
+        const subscription = await this.getPrimarySubscriptionRecord();
+        records.push(subscription);
+        const subscriptionCustomer = HelloFreshBrowser.recordValue(subscription.customer);
+        if (subscriptionCustomer)
+            records.push(subscriptionCustomer);
+        const paths = [
+            `/gw/api/customers/me?country=${encodeURIComponent(this.country)}&locale=${encodeURIComponent(this.locale)}`,
+            `/gw/api/customers/me/profile?country=${encodeURIComponent(this.country)}&locale=${encodeURIComponent(this.locale)}`,
+            `/gw/api/customers/me/preferences?country=${encodeURIComponent(this.country)}&locale=${encodeURIComponent(this.locale)}`,
+        ];
+        for (const path of paths) {
+            try {
+                const response = await this.apiGet(path);
+                const record = HelloFreshBrowser.recordValue(response.customer) ??
+                    HelloFreshBrowser.recordValue(response.profile) ??
+                    HelloFreshBrowser.recordValue(response.preferences) ??
+                    response;
+                records.push(record);
+            }
+            catch {
+                // Some regions expose only subscription/customer records.
+            }
+        }
+        return records;
+    }
+    preferencesFromApiRecords(records) {
+        const dietaryPreferences = this.preferenceStrings(records, [
+            "dietaryPreferences",
+            "dietPreferences",
+            "selectedPreferences",
+            "preferences",
+            "preferenceSelections",
+        ]);
+        const allergens = this.preferenceStrings(records, [
+            "allergens",
+            "allergenInformation",
+            "allergyPreferences",
+            "excludedAllergens",
+        ]);
+        const cuisinePreferences = this.preferenceStrings(records, [
+            "cuisinePreferences",
+            "cuisines",
+            "preferredCuisines",
+        ]);
+        const vegetarian = this.preferenceBoolean(records, ["vegetarian", "isVegetarian"]) ||
+            dietaryPreferences.some((value) => /vegetarian|veggie|vegetar/i.test(value)) ||
+            records.some((record) => /vegetarian|veggie|vegetar/i.test(HelloFreshBrowser.stringValue(record.preset)));
+        const familyFriendly = this.preferenceBoolean(records, ["familyFriendly", "isFamilyFriendly"]) ||
+            dietaryPreferences.some((value) => /family|familie/i.test(value));
+        const calorieGoal = this.preferenceNumber(records, [
+            "calorieGoal",
+            "caloriePreference",
+            "calories",
+            "targetCalories",
+        ]);
+        if (dietaryPreferences.length === 0 &&
+            allergens.length === 0 &&
+            cuisinePreferences.length === 0 &&
+            !vegetarian &&
+            !familyFriendly &&
+            calorieGoal === undefined) {
+            return null;
+        }
+        return {
+            dietaryPreferences: dietaryPreferences.filter((value) => !/vegetarian|veggie|vegetar|family|familie/i.test(value)),
+            allergens,
+            cuisinePreferences,
+            familyFriendly,
+            vegetarian,
+            calorieGoal,
+        };
+    }
+    preferenceStrings(records, keys) {
+        return HelloFreshBrowser.uniqueStrings(records.flatMap((record) => this.preferenceFieldValues(record, keys).flatMap((value) => this.collectPreferenceStrings(value))));
+    }
+    preferenceBoolean(records, keys) {
+        return records.some((record) => this.preferenceFieldValues(record, keys).some((value) => {
+            if (typeof value === "boolean")
+                return value;
+            const text = HelloFreshBrowser.stringValue(value).trim().toLowerCase();
+            return text === "true" || text === "yes";
+        }));
+    }
+    preferenceNumber(records, keys) {
+        for (const record of records) {
+            for (const value of this.preferenceFieldValues(record, keys)) {
+                const parsed = HelloFreshBrowser.maybeNumber(value);
+                if (parsed !== undefined)
+                    return parsed;
+            }
+        }
+        return undefined;
+    }
+    preferenceFieldValues(record, keys) {
+        const containers = [
+            record,
+            HelloFreshBrowser.recordValue(record.preferences),
+            HelloFreshBrowser.recordValue(record.profile),
+            HelloFreshBrowser.recordValue(record.customer),
+            HelloFreshBrowser.recordValue(record.attributes),
+            HelloFreshBrowser.recordValue(record.data),
+        ].filter((value) => Boolean(value));
+        const values = [];
+        for (const container of containers) {
+            for (const key of keys) {
+                if (key in container) {
+                    values.push(container[key]);
+                }
+            }
+        }
+        return values;
+    }
+    collectPreferenceStrings(value) {
+        if (typeof value === "string") {
+            const text = value.trim();
+            return text ? [text] : [];
+        }
+        if (Array.isArray(value)) {
+            return value.flatMap((item) => this.collectPreferenceStrings(item));
+        }
+        const record = HelloFreshBrowser.recordValue(value);
+        if (!record)
+            return [];
+        if (record.selected === false || record.enabled === false || record.active === false) {
+            return [];
+        }
+        const named = HelloFreshBrowser.stringValue(record.name ?? record.label ?? record.title ?? record.value).trim();
+        if (named)
+            return [named];
+        return [
+            ...this.collectPreferenceStrings(record.items),
+            ...this.collectPreferenceStrings(record.values),
+            ...this.collectPreferenceStrings(record.options),
+        ];
+    }
+    async scrapePreferencesFromPage() {
+        const page = await this.ensurePage();
+        await page.goto(`${this.baseUrl}/my-account/preferences`, { waitUntil: "domcontentloaded" });
+        await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+        const preferences = await page.evaluate(() => {
+            const checkedPrefs = Array.from(document.querySelectorAll('input[type="checkbox"]:checked, [data-testid*="preference"][aria-checked="true"]')).map((el) => el.getAttribute("value") ||
+                el.getAttribute("name") ||
+                el.value ||
+                "");
+            const lower = checkedPrefs.map((pref) => pref.toLowerCase());
+            return {
+                dietaryPreferences: checkedPrefs.filter((pref) => !pref.toLowerCase().includes("allergen") && !pref.toLowerCase().includes("cuisine")),
+                allergens: checkedPrefs.filter((pref) => pref.toLowerCase().includes("allergen")),
+                cuisinePreferences: checkedPrefs.filter((pref) => pref.toLowerCase().includes("cuisine")),
+                familyFriendly: lower.some((pref) => pref.includes("family") || pref.includes("familie")),
+                vegetarian: lower.some((pref) => pref.includes("vegetarian") || pref.includes("veggie") || pref.includes("vegetar")),
+            };
+        });
+        const hasSignals = preferences.dietaryPreferences.length > 0 ||
+            preferences.allergens.length > 0 ||
+            preferences.cuisinePreferences.length > 0 ||
+            preferences.familyFriendly ||
+            preferences.vegetarian;
+        return hasSignals ? preferences : null;
     }
     async captureBrowserSession() {
         if (!this.context)
@@ -752,7 +1512,30 @@ class HelloFreshBrowser {
         headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
         headers.set("Referer", `${this.baseUrl}/menu`);
         headers.set("Origin", this.baseUrl);
-        return fetch(url, { ...init, headers });
+        return this.fetchWithTimeout(url, path, { ...init, headers });
+    }
+    async fetchWithTimeout(url, path, init = {}) {
+        const controller = init.signal ? null : new AbortController();
+        const timeout = controller
+            ? setTimeout(() => controller.abort(), this.apiTimeoutMs)
+            : undefined;
+        try {
+            return await fetch(url, {
+                ...init,
+                signal: init.signal ?? controller?.signal,
+            });
+        }
+        catch (error) {
+            if (controller && error instanceof Error && error.name === "AbortError") {
+                throw new Error(`HelloFresh API request timed out after ${this.apiTimeoutMs}ms: ${path}`);
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            throw new Error(`HelloFresh API request failed for ${path}: ${message}`);
+        }
+        finally {
+            if (timeout)
+                clearTimeout(timeout);
+        }
     }
     async parseApiResponse(response) {
         const text = await response.text();
@@ -789,7 +1572,8 @@ class HelloFreshBrowser {
             return false;
         if (HelloFreshBrowser.isRefreshTokenExpired(this.apiSession.auth))
             return false;
-        const response = await fetch(new URL(`/gw/refresh?locale=${encodeURIComponent(this.locale)}&country=${encodeURIComponent(this.country)}`, this.baseUrl), {
+        const refreshPath = `/gw/refresh?locale=${encodeURIComponent(this.locale)}&country=${encodeURIComponent(this.country)}`;
+        const response = await this.fetchWithTimeout(new URL(refreshPath, this.baseUrl), refreshPath, {
             method: "POST",
             headers: {
                 "Accept": "application/json",
@@ -1342,7 +2126,7 @@ class HelloFreshBrowser {
         return selected;
     }
     async scrapeRecipesFromCurrentPage() {
-        const page = this.page;
+        const page = await this.ensurePage();
         return page.evaluate(() => {
             const cards = Array.from(document.querySelectorAll('[data-testid*="recipe"], [data-test-id*="recipe"], [class*="RecipeCard"], [class*="recipe-card"], article'));
             const seen = new Set();
@@ -1379,10 +2163,13 @@ class HelloFreshBrowser {
             });
         });
     }
-    async scrapeDeliveryScheduleFromCurrentPage() {
-        const page = this.page;
-        await page.goto(`${this.baseUrl}/my-account/deliveries`, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+    async scrapeDeliveryScheduleFromCurrentPage(navigationTimeoutMs = 20_000) {
+        const page = await this.ensurePage();
+        await page.goto(`${this.baseUrl}/my-account/deliveries`, {
+            waitUntil: "domcontentloaded",
+            timeout: navigationTimeoutMs,
+        });
+        await page.waitForLoadState("networkidle", { timeout: navigationTimeoutMs }).catch(() => { });
         return page.evaluate(() => Array.from(document.querySelectorAll('[data-testid*="delivery"], [class*="DeliveryCard"], [class*="delivery-card"], article')).map((el) => ({
             weekId: el.getAttribute("data-week") || el.getAttribute("data-delivery-id") || "",
             deliveryDate: el.querySelector('[class*="date"], [data-testid*="date"]')?.textContent?.trim() || "",
@@ -1396,7 +2183,7 @@ class HelloFreshBrowser {
         })));
     }
     async scrapeSubscriptionFromCurrentPage() {
-        const page = this.page;
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/my-account/plan`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         return page.evaluate(() => {
@@ -1414,7 +2201,7 @@ class HelloFreshBrowser {
         });
     }
     async scrapePastOrdersFromCurrentPage(limit) {
-        const page = this.page;
+        const page = await this.ensurePage();
         await page.goto(`${this.baseUrl}/my-account/orders`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
         return page.evaluate((maxOrders) => Array.from(document.querySelectorAll('[data-testid*="order"], [class*="OrderCard"], [class*="order-card"], article'))
@@ -1469,11 +2256,15 @@ class HelloFreshBrowser {
         return line || "Unknown error";
     }
     async setCheckboxByLocator(locator, value) {
-        if (await locator.isVisible({ timeout: 3_000 }).catch(() => false)) {
-            const isChecked = await locator.isChecked().catch(() => false);
-            if (value !== isChecked)
-                await locator.click();
+        if (!(await locator.isVisible({ timeout: 3_000 }).catch(() => false))) {
+            return { found: false, changed: false };
         }
+        const isChecked = await locator.isChecked().catch(() => false);
+        if (value !== isChecked) {
+            await locator.click();
+            return { found: true, changed: true };
+        }
+        return { found: true, changed: false };
     }
     async selectPlanOption(page, field, value) {
         const select = page.locator(`[data-testid*="${field}-select"], select[name*="${field}"]`).first();
@@ -1603,6 +2394,16 @@ class HelloFreshBrowser {
         if (value === null || value === undefined)
             return "";
         return String(value);
+    }
+    static maybeNumber(value) {
+        if (typeof value === "number" && Number.isFinite(value))
+            return value;
+        if (typeof value === "string") {
+            const parsed = Number.parseFloat(value.replace(",", "."));
+            if (Number.isFinite(parsed))
+                return parsed;
+        }
+        return undefined;
     }
     static uniqueStrings(values) {
         const seen = new Set();
