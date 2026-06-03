@@ -84,13 +84,18 @@ test('getDeliverySchedule surfaces API timeouts instead of scraping fallback', a
   assert.equal(fallbackCalled, false);
 });
 
-test('normalizeOrderRecord extracts meals, dates, and currency', () => {
+test('normalizeOrderRecord extracts meals, order-line dates, and currency', () => {
   const browser = createBrowser();
   const order = browser['normalizeOrderRecord']({
     incrementId: '1000123',
-    delivery_date: '2026-05-01',
     lineItems: [
       { product: { recipe: { id: 'o1', name: 'Curry' } }, quantity: 2 },
+    ],
+    orderLines: [
+      {
+        deliveryDate: '2026-05-01T00:00:00+0200',
+        paymentStatus: 'paid',
+      },
     ],
     grandTotal: 2599,
     state: 'Delivered',
@@ -98,24 +103,97 @@ test('normalizeOrderRecord extracts meals, dates, and currency', () => {
 
   assert.deepEqual(order, {
     orderId: '1000123',
-    deliveryDate: '2026-05-01',
+    deliveryDate: '2026-05-01T00:00:00+0200',
     meals: [{ recipeId: 'o1', recipeName: 'Curry', servings: 2 }],
     totalPrice: 25.99,
     status: 'Delivered',
   });
 });
 
-test('getPastOrders throws clear partial-data error when neither API nor fallback has details', async () => {
+test('getPastOrders enriches meal-box orders from past deliveries page', async () => {
   const browser = createBrowser();
   browser['isLoggedIn'] = true;
   browser['apiGet'] = async () => ({
-    items: [{ orderId: 'ord-1', deliveryDate: '', meals: [] }],
+    items: [
+      {
+        id: 'meal-order',
+        orderLines: [
+          {
+            deliveryDate: '2026-04-13T00:00:00+0200',
+            productOrdered: { specs: { meals: 6, size: 2 } },
+            sku: 'NL-CBU-6-2-0',
+          },
+        ],
+        grandTotal: 73.98,
+      },
+      {
+        id: 'charge-order',
+        orderLines: [
+          {
+            deliveryDate: '2026-04-13T00:00:00+0200',
+            productOrdered: { specs: { meals: 0, size: 0 } },
+            sku: 'NL-CHARGE-0-0-0',
+          },
+        ],
+        grandTotal: 5,
+      },
+    ],
   });
   browser['getOrderDetailRecord'] = async () => {
     throw new Error('not found');
   };
   browser['scrapePastOrdersFromCurrentPage'] = async () => [
-    { orderId: 'ord-1', deliveryDate: '', meals: [], totalPrice: 0, status: 'Delivered' },
+    {
+      weekId: '2026-W16',
+      deliveryDate: 'Bezorgd op ma. 13 apr',
+      meals: [
+        { recipeId: 'r1', recipeName: 'Pasta', servings: 0 },
+        { recipeId: 'r2', recipeName: 'Soup', servings: 0 },
+      ],
+    },
+  ];
+
+  const orders = await browser.getPastOrders(2);
+  assert.deepEqual(orders[0], {
+    orderId: 'meal-order',
+    deliveryDate: '2026-04-13T00:00:00+0200',
+    meals: [
+      { recipeId: 'r1', recipeName: 'Pasta', servings: 2 },
+      { recipeId: 'r2', recipeName: 'Soup', servings: 2 },
+    ],
+    totalPrice: 73.98,
+    status: 'Delivered',
+  });
+  assert.deepEqual(orders[1], {
+    orderId: 'charge-order',
+    deliveryDate: '2026-04-13T00:00:00+0200',
+    meals: [],
+    totalPrice: 5,
+    status: 'Delivered',
+  });
+});
+
+test('getPastOrders throws clear partial-data error when meal-box orders still lack details', async () => {
+  const browser = createBrowser();
+  browser['isLoggedIn'] = true;
+  browser['apiGet'] = async () => ({
+    items: [
+      {
+        orderId: 'ord-1',
+        orderLines: [
+          {
+            deliveryDate: '',
+            productOrdered: { specs: { meals: 6, size: 2 } },
+          },
+        ],
+      },
+    ],
+  });
+  browser['getOrderDetailRecord'] = async () => {
+    throw new Error('not found');
+  };
+  browser['scrapePastOrdersFromCurrentPage'] = async () => [
+    { weekId: '2026-W16', deliveryDate: '', meals: [] },
   ];
 
   await assert.rejects(() => browser.getPastOrders(1), /partial data/);

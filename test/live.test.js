@@ -121,13 +121,16 @@ test('live read-only tool handlers return compact and normalized responses', {
       assert.ok(Array.isArray(first.meals));
     }
 
-    try {
-      const orders = await callServerTool(server, 'get_past_orders', { limit: 10 });
-      const nonEmptyOrders = orders.data.orders.filter((order) => order.deliveryDate || order.meals.length > 0);
-      assert.ok(nonEmptyOrders.length > 0, 'live orders should not all be empty summaries');
-    } catch (error) {
-      assert.match(error.message, /partial data|orders API/i);
-    }
+    const orders = await callServerTool(server, 'get_past_orders', { limit: 3 });
+    assert.equal(orders.data.order_count, orders.data.orders.length);
+    assert.ok(
+      orders.data.orders.every((order) => order.deliveryDate),
+      'live orders should include delivery dates'
+    );
+    assert.ok(
+      orders.data.orders.some((order) => order.meals.length > 0),
+      'live meal-box orders should include historical meals'
+    );
 
     try {
       const preferences = await callServerTool(server, 'get_preferences');

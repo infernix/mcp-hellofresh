@@ -680,28 +680,41 @@ class HelloFreshBrowser {
         await this.ensureLoggedIn();
         try {
             const data = await this.apiGet(`/gw/api/customers/me/orders?country=${encodeURIComponent(this.country)}&limit=${encodeURIComponent(String(limit))}&locale=${encodeURIComponent(this.locale)}`);
-            const orders = [];
-            const incompleteOrders = [];
+            const records = [];
+            let orders = [];
+            let incompleteOrders = [];
             for (const order of HelloFreshBrowser.asArray(data.items ?? data.orders).slice(0, limit)) {
                 const summary = HelloFreshBrowser.recordValue(order) ?? {};
+                let mergedRecord = summary;
                 let normalized = this.normalizeOrderRecord(summary);
-                if ((!normalized.deliveryDate || normalized.meals.length === 0) && normalized.orderId) {
+                if (this.orderIsIncomplete(normalized, mergedRecord) && normalized.orderId) {
                     try {
                         const detailResponse = await this.getOrderDetailRecord(normalized.orderId);
                         const detail = HelloFreshBrowser.recordValue(detailResponse.item ?? detailResponse.order) ?? detailResponse;
-                        normalized = this.normalizeOrderRecord({ ...summary, ...detail });
+                        mergedRecord = { ...summary, ...detail };
+                        normalized = this.normalizeOrderRecord(mergedRecord);
                     }
                     catch {
                         // Keep the summary result and assess completeness below.
                     }
                 }
-                if (!normalized.deliveryDate || normalized.meals.length === 0) {
+                if (this.orderIsIncomplete(normalized, mergedRecord)) {
                     incompleteOrders.push(normalized.orderId || "<unknown>");
                 }
+                records.push(mergedRecord);
                 orders.push(normalized);
             }
-            if (orders.length > 0 && incompleteOrders.length === orders.length) {
-                throw new Error(`HelloFresh orders API returned partial data for all requested orders even after detail lookups: ${incompleteOrders.join(", ")}`);
+            if (incompleteOrders.length > 0) {
+                const scraped = await this.scrapePastOrdersFromCurrentPage(limit).catch(() => []);
+                if (scraped.length > 0) {
+                    orders = this.mergeOrdersWithScrapedPastDeliveries(orders, records, scraped);
+                    incompleteOrders = orders
+                        .filter((order, index) => this.orderIsIncomplete(order, records[index]))
+                        .map((order) => order.orderId || "<unknown>");
+                }
+            }
+            if (orders.length > 0 && incompleteOrders.length === orders.filter((order, index) => this.orderNeedsHistoricalMeals(records[index]) || !order.deliveryDate).length) {
+                throw new Error(`HelloFresh orders API returned partial data for all requested meal-box orders even after page enrichment: ${incompleteOrders.join(", ")}`);
             }
             return orders;
         }
@@ -710,7 +723,7 @@ class HelloFreshBrowser {
             try {
                 const scraped = await this.scrapePastOrdersFromCurrentPage(limit);
                 if (scraped.some((order) => order.deliveryDate || order.meals.length > 0)) {
-                    return scraped;
+                    return this.ordersFromScrapedPastDeliveries(scraped);
                 }
             }
             catch (fallbackError) {
@@ -1210,16 +1223,10 @@ class HelloFreshBrowser {
         const orderId = HelloFreshBrowser.stringValue(record.id ??
             record.orderId ??
             record.incrementId ??
+            record.orderNr ??
             record.number ??
             nestedDelivery?.id);
-        const deliveryDate = HelloFreshBrowser.stringValue(record.deliveryDate ??
-            record.delivery_date ??
-            record.date ??
-            record.deliveredAt ??
-            record.expectedDeliveryDate ??
-            nestedDelivery?.date ??
-            nestedDelivery?.deliveryDate ??
-            nestedDelivery?.expectedDeliveryDate);
+        const deliveryDate = this.orderDeliveryDate(record);
         return {
             orderId,
             deliveryDate,
@@ -1234,8 +1241,97 @@ class HelloFreshBrowser {
                 nestedDelivery?.lineItems ??
                 nestedDelivery?.items),
             totalPrice: this.normalizeCurrencyAmount(record.totalPrice ?? record.total ?? record.price ?? record.grandTotal),
-            status: HelloFreshBrowser.stringValue(record.status ?? record.state ?? nestedDelivery?.status ?? "Delivered"),
+            status: HelloFreshBrowser.stringValue(record.status ??
+                record.state ??
+                nestedDelivery?.status ??
+                HelloFreshBrowser.recordValue(this.orderLineRecords(record)[0])?.paymentStatus ??
+                "Delivered"),
         };
+    }
+    orderDeliveryDate(record) {
+        const nestedDelivery = HelloFreshBrowser.recordValue(record.delivery);
+        const lineDelivery = this.orderLineRecords(record)
+            .map((line) => HelloFreshBrowser.stringValue(line.deliveryDate ?? line.date))
+            .find(Boolean);
+        return HelloFreshBrowser.stringValue(record.deliveryDate ??
+            record.delivery_date ??
+            record.date ??
+            record.deliveredAt ??
+            record.expectedDeliveryDate ??
+            nestedDelivery?.date ??
+            nestedDelivery?.deliveryDate ??
+            nestedDelivery?.expectedDeliveryDate ??
+            lineDelivery);
+    }
+    orderLineRecords(record) {
+        return HelloFreshBrowser.asArray(record.orderLines ?? record.lines)
+            .map((line) => HelloFreshBrowser.recordValue(line))
+            .filter((line) => Boolean(line));
+    }
+    orderNeedsHistoricalMeals(record) {
+        return this.orderLineRecords(record).some((line) => {
+            const productOrdered = HelloFreshBrowser.recordValue(line.productOrdered);
+            const specs = HelloFreshBrowser.recordValue(productOrdered?.specs);
+            return HelloFreshBrowser.numberValue(specs?.meals, 0) > 0;
+        });
+    }
+    orderServingCount(record) {
+        for (const line of this.orderLineRecords(record)) {
+            const productOrdered = HelloFreshBrowser.recordValue(line.productOrdered);
+            const specs = HelloFreshBrowser.recordValue(productOrdered?.specs);
+            const size = HelloFreshBrowser.numberValue(specs?.size, 0);
+            if (size > 0)
+                return size;
+        }
+        return 2;
+    }
+    orderWeekId(record) {
+        const deliveryDate = this.orderDeliveryDate(record);
+        const dateOnly = deliveryDate.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (dateOnly) {
+            return HelloFreshBrowser.isoWeek(new Date(Date.UTC(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]), 12)));
+        }
+        const deliveryTime = Date.parse(deliveryDate);
+        if (!Number.isFinite(deliveryTime))
+            return "";
+        return HelloFreshBrowser.isoWeek(new Date(deliveryTime));
+    }
+    orderIsIncomplete(order, record) {
+        if (!order.deliveryDate)
+            return true;
+        return this.orderNeedsHistoricalMeals(record) && order.meals.length === 0;
+    }
+    mergeOrdersWithScrapedPastDeliveries(orders, records, scraped) {
+        const scrapedByWeek = new Map(scraped.map((order) => [order.weekId, order]));
+        return orders.map((order, index) => {
+            const record = records[index];
+            if (!this.orderNeedsHistoricalMeals(record))
+                return order;
+            const scrapedOrder = scrapedByWeek.get(this.orderWeekId(record));
+            if (!scrapedOrder)
+                return order;
+            const servings = this.orderServingCount(record);
+            const meals = order.meals.length > 0
+                ? order.meals
+                : scrapedOrder.meals.map((meal) => ({
+                    ...meal,
+                    servings: meal.servings || servings,
+                }));
+            return {
+                ...order,
+                deliveryDate: order.deliveryDate || scrapedOrder.deliveryDate,
+                meals,
+            };
+        });
+    }
+    ordersFromScrapedPastDeliveries(scraped) {
+        return scraped.map((order) => ({
+            orderId: order.weekId,
+            deliveryDate: order.deliveryDate,
+            meals: order.meals,
+            totalPrice: 0,
+            status: "Delivered",
+        }));
     }
     selectedMealsFromUnknownItems(value) {
         const meals = [];
@@ -2202,21 +2298,35 @@ class HelloFreshBrowser {
     }
     async scrapePastOrdersFromCurrentPage(limit) {
         const page = await this.ensurePage();
-        await page.goto(`${this.baseUrl}/my-account/orders`, { waitUntil: "domcontentloaded" });
+        await page.goto(`${this.baseUrl}/my-account/deliveries/past-deliveries?locale=${encodeURIComponent(this.locale)}`, { waitUntil: "domcontentloaded" });
         await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
-        return page.evaluate((maxOrders) => Array.from(document.querySelectorAll('[data-testid*="order"], [class*="OrderCard"], [class*="order-card"], article'))
+        const showMoreButton = page.locator('[data-test-id="past-deliveries-show-more-button"]').first();
+        for (let attempts = 0; attempts < Math.min(limit, 12); attempts += 1) {
+            const loadedCards = await page.locator('[id^="past-delivery-week-"]').count().catch(() => 0);
+            if (loadedCards >= limit)
+                break;
+            if (!(await showMoreButton.isVisible({ timeout: 1_000 }).catch(() => false)))
+                break;
+            await showMoreButton.click().catch(() => { });
+            await page
+                .waitForFunction((previousCount) => document.querySelectorAll('[id^="past-delivery-week-"]').length > previousCount, loadedCards, { timeout: 5_000 })
+                .catch(() => { });
+        }
+        return page.evaluate((maxOrders) => Array.from(document.querySelectorAll('[id^="past-delivery-week-"]'))
             .slice(0, maxOrders)
-            .map((el) => ({
-            orderId: el.getAttribute("data-order-id") || el.getAttribute("data-id") || "",
-            deliveryDate: el.querySelector('[class*="date"], [data-testid*="date"]')?.textContent?.trim() || "",
-            meals: Array.from(el.querySelectorAll('[class*="meal"], [class*="recipe"]')).map((meal) => ({
-                recipeId: meal.getAttribute("data-recipe-id") || "",
-                recipeName: meal.textContent?.trim() || "",
-                servings: 2,
-            })),
-            totalPrice: Number.parseFloat(el.textContent?.match(/[€$]\s*([\d.,]+)/)?.[1]?.replace(",", ".") ?? "0") || 0,
-            status: el.querySelector('[class*="status"]')?.textContent?.trim() || "Delivered",
-        })), limit);
+            .map((card) => ({
+            weekId: card.id.replace(/^past-delivery-week-/, ""),
+            deliveryDate: card.querySelector('[data-test-id="past-deliveries-delivery-date"]')?.textContent?.trim() || "",
+            meals: Array.from(card.querySelectorAll('[data-test-id="past-recipe-card"]')).map((meal) => {
+                const productElement = Array.from(meal.querySelectorAll('[data-test-id]')).find((element) => /^product-[A-Za-z0-9]+$/.test(element.getAttribute("data-test-id") || ""));
+                return {
+                    recipeId: (productElement?.getAttribute("data-test-id") || "").replace(/^product-/, ""),
+                    recipeName: meal.querySelector('[data-test-id="product-name"]')?.textContent?.trim() || "",
+                    servings: 0,
+                };
+            }).filter((meal) => meal.recipeId || meal.recipeName),
+        }))
+            .filter((order) => order.deliveryDate || order.meals.length > 0), limit);
     }
     async acceptCookiesIfPresent(page) {
         const selectors = [

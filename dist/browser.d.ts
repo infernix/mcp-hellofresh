@@ -305,6 +305,14 @@ export declare class HelloFreshBrowser {
     private deliveryNeedsMenuLookup;
     private deliveryCanModify;
     private normalizeOrderRecord;
+    private orderDeliveryDate;
+    private orderLineRecords;
+    private orderNeedsHistoricalMeals;
+    private orderServingCount;
+    private orderWeekId;
+    private orderIsIncomplete;
+    private mergeOrdersWithScrapedPastDeliveries;
+    private ordersFromScrapedPastDeliveries;
     private selectedMealsFromUnknownItems;
     private getOrderDetailRecord;
     private normalizeCurrencyAmount;
