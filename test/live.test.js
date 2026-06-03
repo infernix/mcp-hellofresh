@@ -121,16 +121,33 @@ test('live read-only tool handlers return compact and normalized responses', {
       assert.ok(Array.isArray(first.meals));
     }
 
-    const orders = await callServerTool(server, 'get_past_orders', { limit: 3 });
-    assert.equal(orders.data.order_count, orders.data.orders.length);
+    const firstPage = await callServerTool(server, 'get_past_orders', { limit: 3, offset: 0 });
+    assert.equal(firstPage.data.order_count, firstPage.data.orders.length);
+    assert.equal(firstPage.data.limit, 3);
+    assert.equal(firstPage.data.offset, 0);
+    assert.equal(typeof firstPage.data.has_more, 'boolean');
+    assert.equal(firstPage.data.next_offset, firstPage.data.has_more ? 3 : null);
     assert.ok(
-      orders.data.orders.every((order) => order.deliveryDate),
+      firstPage.data.orders.every((order) => order.deliveryDate),
       'live orders should include delivery dates'
     );
     assert.ok(
-      orders.data.orders.some((order) => order.meals.length > 0),
+      firstPage.data.orders.some((order) => order.meals.length > 0),
       'live meal-box orders should include historical meals'
     );
+
+    if (firstPage.data.has_more) {
+      const secondPage = await callServerTool(server, 'get_past_orders', {
+        limit: 3,
+        offset: firstPage.data.next_offset,
+      });
+      assert.equal(secondPage.data.offset, firstPage.data.next_offset);
+      assert.notDeepEqual(
+        secondPage.data.orders.map((order) => order.orderId),
+        firstPage.data.orders.map((order) => order.orderId),
+        'paginated historical orders should advance to a different slice'
+      );
+    }
 
     try {
       const preferences = await callServerTool(server, 'get_preferences');

@@ -110,35 +110,40 @@ test('normalizeOrderRecord extracts meals, order-line dates, and currency', () =
   });
 });
 
-test('getPastOrders enriches meal-box orders from past deliveries page', async () => {
+test('getPastOrders enriches meal-box orders from past deliveries page and returns pagination metadata', async () => {
   const browser = createBrowser();
   browser['isLoggedIn'] = true;
-  browser['apiGet'] = async () => ({
-    items: [
-      {
-        id: 'meal-order',
-        orderLines: [
-          {
-            deliveryDate: '2026-04-13T00:00:00+0200',
-            productOrdered: { specs: { meals: 6, size: 2 } },
-            sku: 'NL-CBU-6-2-0',
-          },
-        ],
-        grandTotal: 73.98,
-      },
-      {
-        id: 'charge-order',
-        orderLines: [
-          {
-            deliveryDate: '2026-04-13T00:00:00+0200',
-            productOrdered: { specs: { meals: 0, size: 0 } },
-            sku: 'NL-CHARGE-0-0-0',
-          },
-        ],
-        grandTotal: 5,
-      },
-    ],
-  });
+  browser['apiGet'] = async (path) => {
+    if (path.includes('limit=1') && path.includes('offset=4')) {
+      return { items: [{ id: 'later-order', orderLines: [{ deliveryDate: '2026-04-20T00:00:00+0200' }] }] };
+    }
+    return {
+      items: [
+        {
+          id: 'meal-order',
+          orderLines: [
+            {
+              deliveryDate: '2026-04-13T00:00:00+0200',
+              productOrdered: { specs: { meals: 6, size: 2 } },
+              sku: 'NL-CBU-6-2-0',
+            },
+          ],
+          grandTotal: 73.98,
+        },
+        {
+          id: 'charge-order',
+          orderLines: [
+            {
+              deliveryDate: '2026-04-13T00:00:00+0200',
+              productOrdered: { specs: { meals: 0, size: 0 } },
+              sku: 'NL-CHARGE-0-0-0',
+            },
+          ],
+          grandTotal: 5,
+        },
+      ],
+    };
+  };
   browser['getOrderDetailRecord'] = async () => {
     throw new Error('not found');
   };
@@ -153,8 +158,12 @@ test('getPastOrders enriches meal-box orders from past deliveries page', async (
     },
   ];
 
-  const orders = await browser.getPastOrders(2);
-  assert.deepEqual(orders[0], {
+  const page = await browser.getPastOrders(2, 2);
+  assert.equal(page.limit, 2);
+  assert.equal(page.offset, 2);
+  assert.equal(page.hasMore, true);
+  assert.equal(page.nextOffset, 4);
+  assert.deepEqual(page.orders[0], {
     orderId: 'meal-order',
     deliveryDate: '2026-04-13T00:00:00+0200',
     meals: [
@@ -164,7 +173,7 @@ test('getPastOrders enriches meal-box orders from past deliveries page', async (
     totalPrice: 73.98,
     status: 'Delivered',
   });
-  assert.deepEqual(orders[1], {
+  assert.deepEqual(page.orders[1], {
     orderId: 'charge-order',
     deliveryDate: '2026-04-13T00:00:00+0200',
     meals: [],
@@ -173,22 +182,65 @@ test('getPastOrders enriches meal-box orders from past deliveries page', async (
   });
 });
 
+test('getPastOrders reports no next page when the probe is empty', async () => {
+  const browser = createBrowser();
+  browser['isLoggedIn'] = true;
+  browser['apiGet'] = async (path) => {
+    if (path.includes('limit=1') && path.includes('offset=1')) {
+      return { items: [] };
+    }
+    return {
+      items: [
+        {
+          id: 'meal-order',
+          orderLines: [
+            {
+              deliveryDate: '2026-04-13T00:00:00+0200',
+              productOrdered: { specs: { meals: 6, size: 2 } },
+            },
+          ],
+          grandTotal: 73.98,
+        },
+      ],
+    };
+  };
+  browser['getOrderDetailRecord'] = async () => {
+    throw new Error('not found');
+  };
+  browser['scrapePastOrdersFromCurrentPage'] = async () => [
+    {
+      weekId: '2026-W16',
+      deliveryDate: 'Bezorgd op ma. 13 apr',
+      meals: [{ recipeId: 'r1', recipeName: 'Pasta', servings: 0 }],
+    },
+  ];
+
+  const page = await browser.getPastOrders(1, 0);
+  assert.equal(page.hasMore, false);
+  assert.equal(page.nextOffset, null);
+});
+
 test('getPastOrders throws clear partial-data error when meal-box orders still lack details', async () => {
   const browser = createBrowser();
   browser['isLoggedIn'] = true;
-  browser['apiGet'] = async () => ({
-    items: [
-      {
-        orderId: 'ord-1',
-        orderLines: [
-          {
-            deliveryDate: '',
-            productOrdered: { specs: { meals: 6, size: 2 } },
-          },
-        ],
-      },
-    ],
-  });
+  browser['apiGet'] = async (path) => {
+    if (path.includes('limit=1') && path.includes('offset=1')) {
+      return { items: [] };
+    }
+    return {
+      items: [
+        {
+          orderId: 'ord-1',
+          orderLines: [
+            {
+              deliveryDate: '',
+              productOrdered: { specs: { meals: 6, size: 2 } },
+            },
+          ],
+        },
+      ],
+    };
+  };
   browser['getOrderDetailRecord'] = async () => {
     throw new Error('not found');
   };

@@ -93,6 +93,13 @@ export interface Order {
   totalPrice: number;
   status: string;
 }
+export interface OrderPage {
+  orders: Order[];
+  limit: number;
+  offset: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+}
 
 export interface MealSelectionInput {
   recipeId: string;
@@ -1070,10 +1077,10 @@ export class HelloFreshBrowser {
     };
   }
 
-  async getPastOrders(limit = 10): Promise<Order[]> {
+  async getPastOrders(limit = 10, offset = 0): Promise<OrderPage> {
     await this.ensureLoggedIn();
     try {
-      const data = await this.apiGet<JsonObject>(`/gw/api/customers/me/orders?country=${encodeURIComponent(this.country)}&limit=${encodeURIComponent(String(limit))}&locale=${encodeURIComponent(this.locale)}`);
+      const data = await this.getOrderSummaries(limit, offset);
       const records: JsonObject[] = [];
       let orders: Order[] = [];
       let incompleteOrders: string[] = [];
@@ -1100,7 +1107,7 @@ export class HelloFreshBrowser {
       }
 
       if (incompleteOrders.length > 0) {
-        const scraped = await this.scrapePastOrdersFromCurrentPage(limit).catch(() => []);
+        const scraped = await this.scrapePastOrdersFromCurrentPage(limit, offset).catch(() => []);
         if (scraped.length > 0) {
           orders = this.mergeOrdersWithScrapedPastDeliveries(orders, records, scraped);
           incompleteOrders = orders
@@ -1109,19 +1116,38 @@ export class HelloFreshBrowser {
         }
       }
 
-      if (orders.length > 0 && incompleteOrders.length === orders.filter((order, index) => this.orderNeedsHistoricalMeals(records[index]) || !order.deliveryDate).length) {
+      if (
+        orders.length > 0 &&
+        incompleteOrders.length ===
+          orders.filter((order, index) => this.orderNeedsHistoricalMeals(records[index]) || !order.deliveryDate).length
+      ) {
         throw new Error(
           `HelloFresh orders API returned partial data for all requested meal-box orders even after page enrichment: ${incompleteOrders.join(", ")}`
         );
       }
 
-      return orders;
+      const hasMore = await this.hasMoreOrders(offset + orders.length);
+      return {
+        orders,
+        limit,
+        offset,
+        hasMore,
+        nextOffset: hasMore ? offset + orders.length : null,
+      };
     } catch (error) {
       const original = error instanceof Error ? error : new Error(String(error));
       try {
-        const scraped = await this.scrapePastOrdersFromCurrentPage(limit);
+        const scraped = await this.scrapePastOrdersFromCurrentPage(limit, offset);
         if (scraped.some((order) => order.deliveryDate || order.meals.length > 0)) {
-          return this.ordersFromScrapedPastDeliveries(scraped);
+          const orders = this.ordersFromScrapedPastDeliveries(scraped);
+          const hasMore = scraped.length === limit;
+          return {
+            orders,
+            limit,
+            offset,
+            hasMore,
+            nextOffset: hasMore ? offset + orders.length : null,
+          };
         }
       } catch (fallbackError) {
         const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
@@ -1846,6 +1872,17 @@ export class HelloFreshBrowser {
         meals,
       };
     });
+  }
+
+  private async getOrderSummaries(limit: number, offset: number): Promise<JsonObject> {
+    return this.apiGet<JsonObject>(
+      `/gw/api/customers/me/orders?country=${encodeURIComponent(this.country)}&limit=${encodeURIComponent(String(limit))}&locale=${encodeURIComponent(this.locale)}&offset=${encodeURIComponent(String(offset))}`
+    );
+  }
+
+  private async hasMoreOrders(offset: number): Promise<boolean> {
+    const probe = await this.getOrderSummaries(1, offset);
+    return HelloFreshBrowser.asArray(probe.items ?? probe.orders).length > 0;
   }
 
   private ordersFromScrapedPastDeliveries(
@@ -2981,9 +3018,9 @@ export class HelloFreshBrowser {
       };
     });
   }
-
   private async scrapePastOrdersFromCurrentPage(
-    limit: number
+    limit: number,
+    offset = 0
   ): Promise<Array<{ weekId: string; deliveryDate: string; meals: SelectedMeal[] }>> {
     const page = await this.ensurePage();
     await page.goto(
@@ -2991,13 +3028,17 @@ export class HelloFreshBrowser {
       { waitUntil: "domcontentloaded" }
     );
     await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => {});
+    await this.acceptCookiesIfPresent(page);
 
+    const targetCount = offset + limit;
     const showMoreButton = page.locator('[data-test-id="past-deliveries-show-more-button"]').first();
-    for (let attempts = 0; attempts < Math.min(limit, 12); attempts += 1) {
+    for (let attempts = 0; attempts < Math.min(targetCount, 50); attempts += 1) {
       const loadedCards = await page.locator('[id^="past-delivery-week-"]').count().catch(() => 0);
-      if (loadedCards >= limit) break;
+      if (loadedCards >= targetCount) break;
       if (!(await showMoreButton.isVisible({ timeout: 1_000 }).catch(() => false))) break;
-      await showMoreButton.click().catch(() => {});
+      await showMoreButton.click({ force: true, timeout: 3_000 }).catch(async () => {
+        await showMoreButton.evaluate((button: HTMLElement) => button.click()).catch(() => {});
+      });
       await page
         .waitForFunction(
           (previousCount) =>
@@ -3008,9 +3049,9 @@ export class HelloFreshBrowser {
         .catch(() => {});
     }
 
-    return page.evaluate((maxOrders: number) =>
+    return page.evaluate(({ start, end }) =>
       Array.from(document.querySelectorAll('[id^="past-delivery-week-"]'))
-        .slice(0, maxOrders)
+        .slice(start, end)
         .map((card) => ({
           weekId: card.id.replace(/^past-delivery-week-/, ""),
           deliveryDate:
@@ -3028,7 +3069,7 @@ export class HelloFreshBrowser {
           }).filter((meal) => meal.recipeId || meal.recipeName),
         }))
         .filter((order) => order.deliveryDate || order.meals.length > 0)
-    , limit);
+    , { start: offset, end: offset + limit });
   }
 
   private async acceptCookiesIfPresent(page: Page): Promise<void> {

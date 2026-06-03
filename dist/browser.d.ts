@@ -76,6 +76,13 @@ export interface Order {
     totalPrice: number;
     status: string;
 }
+export interface OrderPage {
+    orders: Order[];
+    limit: number;
+    offset: number;
+    hasMore: boolean;
+    nextOffset: number | null;
+}
 export interface MealSelectionInput {
     recipeId: string;
     servings?: number;
@@ -279,7 +286,7 @@ export declare class HelloFreshBrowser {
         success: boolean;
         message: string;
     }>;
-    getPastOrders(limit?: number): Promise<Order[]>;
+    getPastOrders(limit?: number, offset?: number): Promise<OrderPage>;
     rateRecipe(recipeId: string, rating: number, comment?: string): Promise<{
         success: boolean;
         message: string;
@@ -312,6 +319,8 @@ export declare class HelloFreshBrowser {
     private orderWeekId;
     private orderIsIncomplete;
     private mergeOrdersWithScrapedPastDeliveries;
+    private getOrderSummaries;
+    private hasMoreOrders;
     private ordersFromScrapedPastDeliveries;
     private selectedMealsFromUnknownItems;
     private getOrderDetailRecord;

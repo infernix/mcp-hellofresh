@@ -149,6 +149,13 @@ const GetPastOrdersSchema = zod_1.z.object({
         .optional()
         .default(10)
         .describe("Maximum number of past orders to retrieve"),
+    offset: zod_1.z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe("Number of past orders to skip before returning results"),
 });
 const RateRecipeSchema = zod_1.z.object({
     recipe_id: zod_1.z.string().describe("The recipe ID to rate"),
@@ -168,7 +175,7 @@ const RateRecipeSchema = zod_1.z.object({
 const TOOLS = [
     {
         name: "get_menu",
-        description: "Get the current week's available recipes/meals from HelloFresh. Optionally specify a week offset to see future menus.",
+        description: "Read-only. List menu recipes for the requested week offset so an agent can discover week_ids, recipe_ids, and current selections before planning or edits.",
         inputSchema: {
             type: "object",
             properties: {
@@ -184,7 +191,7 @@ const TOOLS = [
     },
     {
         name: "get_menu_for_week",
-        description: "Get the available recipes/meals for a specific delivery week, including which meals are already selected.",
+        description: "Read-only. Return the compact planning view for one delivery week: recipe ids, menu indexes, selection state, servings, cooking time, and per-serving nutrition.",
         inputSchema: {
             type: "object",
             properties: {
@@ -198,7 +205,7 @@ const TOOLS = [
     },
     {
         name: "get_recipe_details",
-        description: "Get full recipe information including ingredients, step-by-step instructions, nutrition facts, prep time, and allergen information.",
+        description: "Read-only. Fetch the full recipe record for one recipe_id, including ingredients, instructions, nutrition, allergens, and utensils when available.",
         inputSchema: {
             type: "object",
             properties: {
@@ -212,7 +219,7 @@ const TOOLS = [
     },
     {
         name: "preview_select_meals",
-        description: "Preview selecting meals for a week without changing the account. Shows current selection, requested selection, added/removed meals, and premium charges.",
+        description: "Read-only. Simulate replacing a week's meal selection without changing the account. Use to inspect additions, removals, and price effects before mutating tools.",
         inputSchema: {
             type: "object",
             properties: {
@@ -244,7 +251,7 @@ const TOOLS = [
     },
     {
         name: "get_recommended_extras",
-        description: "List meal-specific recommended extras/proteins for the currently selected meals in a week, or for a provided subset of selected meal recipe IDs.",
+        description: "Read-only. List meal-specific recommended extras for the currently selected meals in a week. Use returned addon_index values with the extras preview/apply tools.",
         inputSchema: {
             type: "object",
             properties: {
@@ -263,7 +270,7 @@ const TOOLS = [
     },
     {
         name: "preview_meal_extras",
-        description: "Preview explicit meal-specific extras for currently selected meals in a week without changing the account.",
+        description: "Read-only. Simulate attaching specific recommended extras to selected meals in a week without changing the account.",
         inputSchema: {
             type: "object",
             properties: {
@@ -292,7 +299,7 @@ const TOOLS = [
     },
     {
         name: "select_meals",
-        description: "Choose specific meals for an upcoming delivery week. You can select multiple recipes by their IDs.",
+        description: "Mutating. Replace the selected meals for an upcoming delivery week using recipe ids from the menu.",
         inputSchema: {
             type: "object",
             properties: {
@@ -324,7 +331,7 @@ const TOOLS = [
     },
     {
         name: "add_recommended_extras",
-        description: "Add HelloFresh's meal-specific recommended extras/proteins for the currently selected meals in a week.",
+        description: "Mutating. Add HelloFresh's default recommended extras for the meals currently selected in a week.",
         inputSchema: {
             type: "object",
             properties: {
@@ -338,7 +345,7 @@ const TOOLS = [
     },
     {
         name: "set_meal_extras",
-        description: "Apply explicit meal-specific extras to selected meals in a week using addon indexes from get_recommended_extras.",
+        description: "Mutating. Attach specific recommended extras to specific selected meals using addon_index values from get_recommended_extras.",
         inputSchema: {
             type: "object",
             properties: {
@@ -367,7 +374,7 @@ const TOOLS = [
     },
     {
         name: "apply_week_plan",
-        description: "Apply a complete stateless weekly plan: select meals with optional meal-bound extras.",
+        description: "Mutating. Apply a full weekly plan in one call: choose meals and optionally attach meal-specific extras.",
         inputSchema: {
             type: "object",
             properties: {
@@ -406,7 +413,7 @@ const TOOLS = [
     },
     {
         name: "preview_week_plan",
-        description: "Preview a complete stateless weekly plan: meal selection with optional meal-bound extras, without changing the account.",
+        description: "Read-only. Simulate a full weekly plan in one call: meals plus optional meal-bound extras, with no account changes.",
         inputSchema: {
             type: "object",
             properties: {
@@ -445,7 +452,7 @@ const TOOLS = [
     },
     {
         name: "skip_week",
-        description: "Skip a delivery week so you won't receive or be charged for that week's box.",
+        description: "Mutating. Skip one upcoming delivery week so that box is not delivered or billed.",
         inputSchema: {
             type: "object",
             properties: {
@@ -459,7 +466,7 @@ const TOOLS = [
     },
     {
         name: "get_delivery_schedule",
-        description: "View all upcoming deliveries including dates, selected meals, and delivery status.",
+        description: "Read-only. List upcoming deliveries with week ids, dates, status, selected meals, and whether each delivery is still modifiable.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -467,7 +474,7 @@ const TOOLS = [
     },
     {
         name: "modify_delivery",
-        description: "Change the delivery date for an upcoming week's box.",
+        description: "Mutating. Change the delivery date for an upcoming delivery week when HelloFresh exposes an alternative date.",
         inputSchema: {
             type: "object",
             properties: {
@@ -485,7 +492,7 @@ const TOOLS = [
     },
     {
         name: "get_preferences",
-        description: "Get your current dietary preferences including vegetarian settings, allergens, cuisine types, and family-friendly options.",
+        description: "Read-only. Return the account's current dietary, allergen, cuisine, vegetarian, and family-friendly preference signals, or a contextual unsupported-data error.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -493,7 +500,7 @@ const TOOLS = [
     },
     {
         name: "update_preferences",
-        description: "Update your dietary and cuisine preferences on HelloFresh, such as vegetarian mode, allergen avoidance, and preferred cuisines.",
+        description: "Mutating. Update supported preference controls on the HelloFresh account. Currently reliable for vegetarian and family-friendly toggles; other fields may be unsupported by the site.",
         inputSchema: {
             type: "object",
             properties: {
@@ -525,7 +532,7 @@ const TOOLS = [
     },
     {
         name: "get_subscription",
-        description: "View your current HelloFresh subscription plan details including meals per week, servings, price, and next delivery.",
+        description: "Read-only. Return the current subscription plan, meals per week, servings, delivery frequency, next delivery date, and status.",
         inputSchema: {
             type: "object",
             properties: {},
@@ -533,7 +540,7 @@ const TOOLS = [
     },
     {
         name: "modify_subscription",
-        description: "Change your HelloFresh subscription plan size (meals per week or servings per meal) or delivery frequency.",
+        description: "Mutating. Change subscription size or delivery frequency when the current account and region expose editable controls.",
         inputSchema: {
             type: "object",
             properties: {
@@ -559,7 +566,7 @@ const TOOLS = [
     },
     {
         name: "get_past_orders",
-        description: "View your HelloFresh order history including delivery dates, meals received, and order status.",
+        description: "Read-only. Return a paginated slice of historical orders. Meal-box orders are enriched with historical recipe selections; charge-only rows may legitimately have no meals.",
         inputSchema: {
             type: "object",
             properties: {
@@ -570,12 +577,18 @@ const TOOLS = [
                     minimum: 1,
                     maximum: 50,
                 },
+                offset: {
+                    type: "number",
+                    description: "Number of past orders to skip before returning results (default: 0)",
+                    default: 0,
+                    minimum: 0,
+                },
             },
         },
     },
     {
         name: "rate_recipe",
-        description: "Rate a HelloFresh recipe you've cooked on a scale of 1-5 stars, optionally including a written review.",
+        description: "Mutating. Submit a 1-5 star rating and optional written review for a cooked recipe.",
         inputSchema: {
             type: "object",
             properties: {
@@ -825,10 +838,14 @@ class HelloFreshMCPServer {
             }
             case "get_past_orders": {
                 const params = GetPastOrdersSchema.parse(args);
-                const orders = await this.hellofresh.getPastOrders(params.limit);
+                const page = await this.hellofresh.getPastOrders(params.limit, params.offset);
                 return text({
-                    order_count: orders.length,
-                    orders,
+                    order_count: page.orders.length,
+                    limit: page.limit,
+                    offset: page.offset,
+                    has_more: page.hasMore,
+                    next_offset: page.nextOffset,
+                    orders: page.orders,
                 });
             }
             case "rate_recipe": {
