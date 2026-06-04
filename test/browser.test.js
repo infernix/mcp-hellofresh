@@ -110,10 +110,25 @@ test('normalizeOrderRecord extracts meals, order-line dates, and currency', () =
   });
 });
 
-test('getPastOrders enriches meal-box orders from past deliveries page and returns pagination metadata', async () => {
+test('getPastOrders enriches meal-box orders from historical deliveries API and returns pagination metadata', async () => {
   const browser = createBrowser();
   browser['isLoggedIn'] = true;
+  browser['getPrimarySubscriptionRecord'] = async () => ({ id: 'sub-1' });
   browser['apiGet'] = async (path) => {
+    if (path.includes('/gw/my-deliveries/past-deliveries')) {
+      return {
+        weeks: [
+          {
+            week: '2026-W16',
+            meals: [
+              { id: 'r1', name: 'Pasta' },
+              { id: 'r2', name: 'Soup' },
+            ],
+          },
+        ],
+        nextWeek: '2026-W15',
+      };
+    }
     if (path.includes('limit=1') && path.includes('offset=4')) {
       return { items: [{ id: 'later-order', orderLines: [{ deliveryDate: '2026-04-20T00:00:00+0200' }] }] };
     }
@@ -147,16 +162,9 @@ test('getPastOrders enriches meal-box orders from past deliveries page and retur
   browser['getOrderDetailRecord'] = async () => {
     throw new Error('not found');
   };
-  browser['scrapePastOrdersFromCurrentPage'] = async () => [
-    {
-      weekId: '2026-W16',
-      deliveryDate: 'Bezorgd op ma. 13 apr',
-      meals: [
-        { recipeId: 'r1', recipeName: 'Pasta', servings: 0 },
-        { recipeId: 'r2', recipeName: 'Soup', servings: 0 },
-      ],
-    },
-  ];
+  browser['scrapePastOrdersFromCurrentPage'] = async () => {
+    throw new Error('browser fallback should not run');
+  };
 
   const page = await browser.getPastOrders(2, 2);
   assert.equal(page.limit, 2);
@@ -180,6 +188,78 @@ test('getPastOrders enriches meal-box orders from past deliveries page and retur
     totalPrice: 5,
     status: 'Delivered',
   });
+});
+
+test('scrapePastOrdersFromCurrentPage reuses cached cards across consecutive pages', async () => {
+  const browser = createBrowser();
+  const cards = Array.from({ length: 6 }, (_, index) => ({
+    weekId: `2026-W${16 + index}`,
+    deliveryDate: `Delivered ${index}`,
+    meals: [{ recipeId: `r${index}`, recipeName: `Meal ${index}`, servings: 0 }],
+  }));
+  const state = { url: '', loaded: 4, gotoCalls: 0, clickCalls: 0 };
+  const showMoreButton = {
+    first() {
+      return this;
+    },
+    async isVisible() {
+      return state.loaded < cards.length;
+    },
+    async click() {
+      state.clickCalls += 1;
+      state.loaded = Math.min(cards.length, state.loaded + 2);
+    },
+    async evaluate() {
+      state.clickCalls += 1;
+      state.loaded = Math.min(cards.length, state.loaded + 2);
+    },
+  };
+  const countLocator = {
+    async count() {
+      return state.loaded;
+    },
+  };
+  const page = {
+    url() {
+      return state.url;
+    },
+    async goto(url) {
+      state.gotoCalls += 1;
+      state.url = url;
+      state.loaded = 4;
+    },
+    async waitForLoadState() {},
+    async waitForFunction(_predicate, previousCount) {
+      if (state.loaded <= previousCount) {
+        throw new Error('expected more cards to load');
+      }
+    },
+    locator(selector) {
+      if (selector === '[data-test-id="past-deliveries-show-more-button"]') return showMoreButton;
+      if (selector === '[id^="past-delivery-week-"]') return countLocator;
+      return {
+        first() {
+          return this;
+        },
+        async isVisible() {
+          return false;
+        },
+      };
+    },
+    async evaluate() {
+      return cards.slice(0, state.loaded);
+    },
+  };
+  browser['ensurePage'] = async () => page;
+  browser['acceptCookiesIfPresent'] = async () => {};
+
+  const firstPage = await browser['scrapePastOrdersFromCurrentPage'](3, 0);
+  const secondPage = await browser['scrapePastOrdersFromCurrentPage'](3, 3);
+
+  assert.deepEqual(firstPage.map((order) => order.weekId), ['2026-W16', '2026-W17', '2026-W18']);
+  assert.deepEqual(secondPage.map((order) => order.weekId), ['2026-W19', '2026-W20', '2026-W21']);
+  assert.equal(state.gotoCalls, 1);
+  assert.equal(state.clickCalls, 1);
 });
 
 test('getPastOrders reports no next page when the probe is empty', async () => {

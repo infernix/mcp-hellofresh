@@ -23,6 +23,9 @@ class HelloFreshBrowser {
     sessionPath;
     apiTimeoutMs;
     apiSession = null;
+    pastDeliveryApiCache = [];
+    pastOrderCache = [];
+    pastOrderCacheComplete = false;
     constructor(options = {}) {
         this.baseUrl = HelloFreshBrowser.normalizeBaseUrl(options.baseUrl ?? HelloFreshBrowser.baseUrlForCountry(options.country));
         this.country = (options.country ?? HelloFreshBrowser.countryFromBaseUrl(this.baseUrl)).toUpperCase();
@@ -705,6 +708,15 @@ class HelloFreshBrowser {
                 orders.push(normalized);
             }
             if (incompleteOrders.length > 0) {
+                const historicalWeeks = await this.getPastDeliveriesForRecords(records).catch(() => []);
+                if (historicalWeeks.length > 0) {
+                    orders = this.mergeOrdersWithScrapedPastDeliveries(orders, records, historicalWeeks);
+                    incompleteOrders = orders
+                        .filter((order, index) => this.orderIsIncomplete(order, records[index]))
+                        .map((order) => order.orderId || "<unknown>");
+                }
+            }
+            if (incompleteOrders.length > 0) {
                 const scraped = await this.scrapePastOrdersFromCurrentPage(limit, offset).catch(() => []);
                 if (scraped.length > 0) {
                     orders = this.mergeOrdersWithScrapedPastDeliveries(orders, records, scraped);
@@ -794,6 +806,9 @@ class HelloFreshBrowser {
         }
         this.isLoggedIn = false;
         this.loginLandingUrl = null;
+        this.pastDeliveryApiCache = [];
+        this.pastOrderCache = [];
+        this.pastOrderCacheComplete = false;
     }
     async ensureLoggedIn() {
         if (!this.isLoggedIn) {
@@ -1340,6 +1355,65 @@ class HelloFreshBrowser {
                 meals,
             };
         });
+    }
+    async getPastDeliveriesForRecords(records) {
+        const requiredWeeks = HelloFreshBrowser.uniqueStrings(records
+            .filter((record) => this.orderNeedsHistoricalMeals(record))
+            .map((record) => this.orderWeekId(record))
+            .filter(Boolean));
+        if (requiredWeeks.length === 0)
+            return [];
+        const cachedByWeek = new Map(this.pastDeliveryApiCache.map((order) => [order.weekId, order]));
+        let missingWeeks = requiredWeeks.filter((week) => !cachedByWeek.has(week)).sort();
+        while (missingWeeks.length > 0) {
+            const fromWeek = missingWeeks[missingWeeks.length - 1];
+            const page = await this.fetchPastDeliveriesPage(fromWeek);
+            if (page.weeks.length === 0)
+                break;
+            for (const week of page.weeks) {
+                cachedByWeek.set(week.weekId, week);
+            }
+            missingWeeks = requiredWeeks.filter((week) => !cachedByWeek.has(week)).sort();
+            if (!page.nextWeek && missingWeeks.length > 0 && missingWeeks.every((week) => week < fromWeek)) {
+                break;
+            }
+        }
+        this.pastDeliveryApiCache = Array.from(cachedByWeek.values()).sort((a, b) => b.weekId.localeCompare(a.weekId));
+        return requiredWeeks
+            .map((week) => cachedByWeek.get(week))
+            .filter((week) => Boolean(week));
+    }
+    async fetchPastDeliveriesPage(fromWeek) {
+        const subscription = await this.getPrimarySubscriptionRecord();
+        const subscriptionId = HelloFreshBrowser.stringValue(subscription.id ??
+            subscription.subscriptionId ??
+            subscription.legacySubscriptionId ??
+            subscription.legacyId);
+        if (!subscriptionId) {
+            throw new Error("HelloFresh subscription id is unavailable for historical deliveries.");
+        }
+        const data = await this.apiGet(`/gw/my-deliveries/past-deliveries?country=${encodeURIComponent(this.country)}&from=${encodeURIComponent(fromWeek)}&locale=${encodeURIComponent(this.locale)}&rating-scale=5&subscription=${encodeURIComponent(subscriptionId)}`);
+        const weeks = HelloFreshBrowser.asArray(data.weeks)
+            .map((week) => HelloFreshBrowser.recordValue(week))
+            .filter((week) => Boolean(week))
+            .map((week) => ({
+            weekId: HelloFreshBrowser.stringValue(week.week ?? week.id),
+            deliveryDate: "",
+            meals: HelloFreshBrowser.asArray(week.meals)
+                .map((meal) => HelloFreshBrowser.recordValue(meal))
+                .filter((meal) => Boolean(meal))
+                .map((meal) => ({
+                recipeId: HelloFreshBrowser.stringValue(meal.id ?? meal.recipeId),
+                recipeName: HelloFreshBrowser.stringValue(meal.name ?? meal.title),
+                servings: 0,
+            }))
+                .filter((meal) => meal.recipeId || meal.recipeName),
+        }))
+            .filter((week) => week.weekId && week.meals.length > 0);
+        return {
+            weeks,
+            nextWeek: HelloFreshBrowser.optionalString(data.nextWeek) ?? null,
+        };
     }
     async getOrderSummaries(limit, offset) {
         return this.apiGet(`/gw/api/customers/me/orders?country=${encodeURIComponent(this.country)}&limit=${encodeURIComponent(String(limit))}&locale=${encodeURIComponent(this.locale)}&offset=${encodeURIComponent(String(offset))}`);
@@ -2321,11 +2395,17 @@ class HelloFreshBrowser {
         });
     }
     async scrapePastOrdersFromCurrentPage(limit, offset = 0) {
-        const page = await this.ensurePage();
-        await page.goto(`${this.baseUrl}/my-account/deliveries/past-deliveries?locale=${encodeURIComponent(this.locale)}`, { waitUntil: "domcontentloaded" });
-        await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
-        await this.acceptCookiesIfPresent(page);
         const targetCount = offset + limit;
+        if (this.pastOrderCache.length >= targetCount || this.pastOrderCacheComplete) {
+            return this.pastOrderCache.slice(offset, offset + limit);
+        }
+        const page = await this.ensurePage();
+        const pastDeliveriesUrl = `${this.baseUrl}/my-account/deliveries/past-deliveries?locale=${encodeURIComponent(this.locale)}`;
+        if (!page.url().includes("/my-account/deliveries/past-deliveries")) {
+            await page.goto(pastDeliveriesUrl, { waitUntil: "domcontentloaded" });
+            await page.waitForLoadState("networkidle", { timeout: 20_000 }).catch(() => { });
+            await this.acceptCookiesIfPresent(page);
+        }
         const showMoreButton = page.locator('[data-test-id="past-deliveries-show-more-button"]').first();
         for (let attempts = 0; attempts < Math.min(targetCount, 50); attempts += 1) {
             const loadedCards = await page.locator('[id^="past-delivery-week-"]').count().catch(() => 0);
@@ -2340,8 +2420,12 @@ class HelloFreshBrowser {
                 .waitForFunction((previousCount) => document.querySelectorAll('[id^="past-delivery-week-"]').length > previousCount, loadedCards, { timeout: 5_000 })
                 .catch(() => { });
         }
-        return page.evaluate(({ start, end }) => Array.from(document.querySelectorAll('[id^="past-delivery-week-"]'))
-            .slice(start, end)
+        this.pastOrderCache = await this.readPastOrdersFromCurrentPage(page);
+        this.pastOrderCacheComplete = !(await showMoreButton.isVisible({ timeout: 500 }).catch(() => false));
+        return this.pastOrderCache.slice(offset, offset + limit);
+    }
+    async readPastOrdersFromCurrentPage(page) {
+        return page.evaluate(() => Array.from(document.querySelectorAll('[id^="past-delivery-week-"]'))
             .map((card) => ({
             weekId: card.id.replace(/^past-delivery-week-/, ""),
             deliveryDate: card.querySelector('[data-test-id="past-deliveries-delivery-date"]')?.textContent?.trim() || "",
@@ -2354,7 +2438,7 @@ class HelloFreshBrowser {
                 };
             }).filter((meal) => meal.recipeId || meal.recipeName),
         }))
-            .filter((order) => order.deliveryDate || order.meals.length > 0), { start: offset, end: offset + limit });
+            .filter((order) => order.deliveryDate || order.meals.length > 0));
     }
     async acceptCookiesIfPresent(page) {
         const selectors = [

@@ -213,6 +213,9 @@ export declare class HelloFreshBrowser {
     private readonly sessionPath;
     private readonly apiTimeoutMs;
     private apiSession;
+    private pastDeliveryApiCache;
+    private pastOrderCache;
+    private pastOrderCacheComplete;
     constructor(options?: HelloFreshBrowserOptions);
     init(): Promise<void>;
     login(credentials: HelloFreshCredentials): Promise<void>;
@@ -319,6 +322,8 @@ export declare class HelloFreshBrowser {
     private orderWeekId;
     private orderIsIncomplete;
     private mergeOrdersWithScrapedPastDeliveries;
+    private getPastDeliveriesForRecords;
+    private fetchPastDeliveriesPage;
     private getOrderSummaries;
     private hasMoreOrders;
     private ordersFromScrapedPastDeliveries;
@@ -371,6 +376,7 @@ export declare class HelloFreshBrowser {
     private scrapeDeliveryScheduleFromCurrentPage;
     private scrapeSubscriptionFromCurrentPage;
     private scrapePastOrdersFromCurrentPage;
+    private readPastOrdersFromCurrentPage;
     private acceptCookiesIfPresent;
     private clickSubmitFallback;
     private extractLoginError;
