@@ -75,6 +75,8 @@ export interface Order {
     meals: SelectedMeal[];
     totalPrice: number;
     status: string;
+    orderType: "meal_box" | "charge_only";
+    itemNames: string[];
 }
 export interface OrderPage {
     orders: Order[];
@@ -316,6 +318,7 @@ export declare class HelloFreshBrowser {
     private deliveryCanModify;
     private normalizeOrderRecord;
     private orderDeliveryDate;
+    private orderItemNames;
     private orderLineRecords;
     private orderNeedsHistoricalMeals;
     private orderServingCount;

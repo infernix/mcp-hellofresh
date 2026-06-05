@@ -135,6 +135,14 @@ test('live read-only tool handlers return compact and normalized responses', {
       firstPage.data.orders.some((order) => order.meals.length > 0),
       'live meal-box orders should include historical meals'
     );
+    assert.ok(
+      firstPage.data.orders.every((order) => order.orderType === 'meal_box' || order.orderType === 'charge_only'),
+      'live orders should classify meal-box vs charge-only rows'
+    );
+    assert.ok(
+      firstPage.data.orders.every((order) => Array.isArray(order.itemNames)),
+      'live orders should include line-item names for agent filtering'
+    );
 
     if (firstPage.data.has_more) {
       const secondPage = await callServerTool(server, 'get_past_orders', {

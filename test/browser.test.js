@@ -107,6 +107,8 @@ test('normalizeOrderRecord extracts meals, order-line dates, and currency', () =
     meals: [{ recipeId: 'o1', recipeName: 'Curry', servings: 2 }],
     totalPrice: 25.99,
     status: 'Delivered',
+    orderType: 'charge_only',
+    itemNames: [],
   });
 });
 
@@ -180,6 +182,8 @@ test('getPastOrders enriches meal-box orders from historical deliveries API and 
     ],
     totalPrice: 73.98,
     status: 'Delivered',
+    orderType: 'meal_box',
+    itemNames: [],
   });
   assert.deepEqual(page.orders[1], {
     orderId: 'charge-order',
@@ -187,6 +191,8 @@ test('getPastOrders enriches meal-box orders from historical deliveries API and 
     meals: [],
     totalPrice: 5,
     status: 'Delivered',
+    orderType: 'charge_only',
+    itemNames: [],
   });
 });
 

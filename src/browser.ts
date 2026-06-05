@@ -92,6 +92,8 @@ export interface Order {
   meals: SelectedMeal[];
   totalPrice: number;
   status: string;
+  orderType: "meal_box" | "charge_only";
+  itemNames: string[];
 }
 
 interface ScrapedPastOrder {
@@ -1784,6 +1786,7 @@ export class HelloFreshBrowser {
         nestedDelivery?.id
     );
     const deliveryDate = this.orderDeliveryDate(record);
+    const orderType = this.orderNeedsHistoricalMeals(record) ? "meal_box" : "charge_only";
     return {
       orderId,
       deliveryDate,
@@ -1807,6 +1810,8 @@ export class HelloFreshBrowser {
           HelloFreshBrowser.recordValue(this.orderLineRecords(record)[0])?.paymentStatus ??
           "Delivered"
       ),
+      orderType,
+      itemNames: this.orderItemNames(record),
     };
   }
 
@@ -1828,6 +1833,20 @@ export class HelloFreshBrowser {
     );
   }
 
+
+  private orderItemNames(record: JsonObject): string[] {
+    return HelloFreshBrowser.uniqueStrings(
+      this.orderLineRecords(record)
+        .map((line) =>
+          HelloFreshBrowser.stringValue(
+            line.name ??
+              HelloFreshBrowser.recordValue(line.productOrdered)?.productName ??
+              HelloFreshBrowser.recordValue(HelloFreshBrowser.recordValue(line.productOrdered)?.family)?.name
+          )
+        )
+        .filter(Boolean)
+    );
+  }
   private orderLineRecords(record: JsonObject): JsonObject[] {
     return HelloFreshBrowser.asArray(record.orderLines ?? record.lines)
       .map((line) => HelloFreshBrowser.recordValue(line))
@@ -1987,6 +2006,8 @@ export class HelloFreshBrowser {
       meals: order.meals,
       totalPrice: 0,
       status: "Delivered",
+      orderType: "meal_box",
+      itemNames: order.meals.map((meal) => meal.recipeName).filter(Boolean),
     }));
   }
 

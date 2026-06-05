@@ -616,7 +616,7 @@ const TOOLS: Tool[] = [
   {
     name: "get_past_orders",
     description:
-      "Read-only. Return a paginated slice of historical orders. Meal-box orders are enriched with historical recipe selections; charge-only rows may legitimately have no meals.",
+      "Read-only. Return a paginated slice of historical orders. Meal-box rows include historical recipe selections; charge-only rows are labeled with orderType and itemNames so agents can ignore dessert, premium, or add-on charges.",
     inputSchema: {
       type: "object",
       properties: {

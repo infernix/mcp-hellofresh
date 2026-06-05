@@ -1259,6 +1259,7 @@ class HelloFreshBrowser {
             record.number ??
             nestedDelivery?.id);
         const deliveryDate = this.orderDeliveryDate(record);
+        const orderType = this.orderNeedsHistoricalMeals(record) ? "meal_box" : "charge_only";
         return {
             orderId,
             deliveryDate,
@@ -1278,6 +1279,8 @@ class HelloFreshBrowser {
                 nestedDelivery?.status ??
                 HelloFreshBrowser.recordValue(this.orderLineRecords(record)[0])?.paymentStatus ??
                 "Delivered"),
+            orderType,
+            itemNames: this.orderItemNames(record),
         };
     }
     orderDeliveryDate(record) {
@@ -1294,6 +1297,13 @@ class HelloFreshBrowser {
             nestedDelivery?.deliveryDate ??
             nestedDelivery?.expectedDeliveryDate ??
             lineDelivery);
+    }
+    orderItemNames(record) {
+        return HelloFreshBrowser.uniqueStrings(this.orderLineRecords(record)
+            .map((line) => HelloFreshBrowser.stringValue(line.name ??
+            HelloFreshBrowser.recordValue(line.productOrdered)?.productName ??
+            HelloFreshBrowser.recordValue(HelloFreshBrowser.recordValue(line.productOrdered)?.family)?.name))
+            .filter(Boolean));
     }
     orderLineRecords(record) {
         return HelloFreshBrowser.asArray(record.orderLines ?? record.lines)
@@ -1429,6 +1439,8 @@ class HelloFreshBrowser {
             meals: order.meals,
             totalPrice: 0,
             status: "Delivered",
+            orderType: "meal_box",
+            itemNames: order.meals.map((meal) => meal.recipeName).filter(Boolean),
         }));
     }
     selectedMealsFromUnknownItems(value) {
