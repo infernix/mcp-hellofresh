@@ -23,6 +23,7 @@ class HelloFreshBrowser {
     sessionPath;
     apiTimeoutMs;
     apiSession = null;
+    credentials = null;
     pastDeliveryApiCache = [];
     pastOrderCache = [];
     pastOrderCacheComplete = false;
@@ -61,11 +62,15 @@ class HelloFreshBrowser {
         }
     }
     async login(credentials) {
+        this.credentials = credentials;
         const storedSession = await this.loadSession();
         if (storedSession && (await this.activateStoredSession(storedSession))) {
             this.isLoggedIn = true;
             return;
         }
+        await this.performCredentialLogin(credentials);
+    }
+    async performCredentialLogin(credentials) {
         let lastError = null;
         for (let attempt = 0; attempt < 2; attempt += 1) {
             try {
@@ -1699,13 +1704,30 @@ class HelloFreshBrowser {
         return this.apiRequest(path);
     }
     async apiRequest(path, init = {}) {
-        await this.ensureApiSession();
-        const response = await this.apiFetch(path, init);
-        if (response.status === 401 && (await this.refreshApiSession())) {
-            const retry = await this.apiFetch(path, init);
-            return this.parseApiResponse(retry);
+        const maxAttempts = this.isRetryableApiRequest(init) ? 3 : 1;
+        let authRecovered = false;
+        for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+            await this.ensureApiSession();
+            const response = await this.apiFetch(path, init);
+            if (response.status === 401) {
+                const recovered = (!authRecovered && (await this.refreshApiSession())) ||
+                    (!authRecovered && (await this.reauthenticateFromStoredCredentials()));
+                if (recovered) {
+                    authRecovered = true;
+                    continue;
+                }
+            }
+            const text = await response.text();
+            if (!response.ok) {
+                if (attempt + 1 < maxAttempts && this.shouldRetryApiFailure(response.status, text, init)) {
+                    await HelloFreshBrowser.sleep(this.retryDelayMs(response, attempt));
+                    continue;
+                }
+                throw new Error(`HelloFresh API ${response.status}: ${text.slice(0, 300)}`);
+            }
+            return (text ? JSON.parse(text) : null);
         }
-        return this.parseApiResponse(response);
+        throw new Error(`HelloFresh API request exhausted retries: ${path}`);
     }
     async apiFetch(path, init = {}) {
         if (!this.apiSession)
@@ -1743,13 +1765,6 @@ class HelloFreshBrowser {
                 clearTimeout(timeout);
         }
     }
-    async parseApiResponse(response) {
-        const text = await response.text();
-        if (!response.ok) {
-            throw new Error(`HelloFresh API ${response.status}: ${text.slice(0, 300)}`);
-        }
-        return (text ? JSON.parse(text) : null);
-    }
     async ensureApiSession() {
         if (this.apiSession && !HelloFreshBrowser.isAccessTokenExpired(this.apiSession.auth))
             return;
@@ -1760,9 +1775,61 @@ class HelloFreshBrowser {
         this.apiSession = storedSession;
         if (HelloFreshBrowser.isAccessTokenExpired(storedSession.auth)) {
             const refreshed = await this.refreshApiSession();
-            if (!refreshed) {
+            if (!refreshed && !(await this.reauthenticateFromStoredCredentials())) {
                 throw new Error("HelloFresh API session expired and could not be refreshed.");
             }
+        }
+    }
+    isRetryableApiRequest(init) {
+        const method = (init.method ?? "GET").toUpperCase();
+        return method === "GET" || method === "HEAD";
+    }
+    shouldRetryApiFailure(status, text, init) {
+        if (!this.isRetryableApiRequest(init))
+            return false;
+        if (status === 429 || status === 502 || status === 503 || status === 504)
+            return true;
+        const lowerText = text.toLowerCase();
+        return (lowerText.includes("overflow") ||
+            lowerText.includes("upstream connect error") ||
+            lowerText.includes("disconnect/reset before headers") ||
+            lowerText.includes("temporarily unavailable"));
+    }
+    retryDelayMs(response, attempt) {
+        const retryAfterMs = this.retryAfterDelayMs(response.headers.get("retry-after"));
+        if (retryAfterMs !== null) {
+            return Math.min(retryAfterMs, 15_000);
+        }
+        const baseDelayMs = 500 * 2 ** attempt;
+        const jitterMultiplier = 0.8 + Math.random() * 0.4;
+        return Math.min(Math.round(baseDelayMs * jitterMultiplier), 5_000);
+    }
+    retryAfterDelayMs(retryAfterHeader) {
+        if (!retryAfterHeader)
+            return null;
+        const trimmed = retryAfterHeader.trim();
+        if (!trimmed)
+            return null;
+        if (/^\d+$/.test(trimmed)) {
+            return Number.parseInt(trimmed, 10) * 1_000;
+        }
+        const retryAt = Date.parse(trimmed);
+        if (!Number.isFinite(retryAt))
+            return null;
+        return Math.max(0, retryAt - Date.now());
+    }
+    async reauthenticateFromStoredCredentials() {
+        if (!this.credentials)
+            return false;
+        this.apiSession = null;
+        this.isLoggedIn = false;
+        await this.close();
+        try {
+            await this.performCredentialLogin(this.credentials);
+            return true;
+        }
+        catch {
+            return false;
         }
     }
     async activateStoredSession(session) {
@@ -2615,6 +2682,9 @@ class HelloFreshBrowser {
     }
     static authExpirySeconds(auth) {
         return auth.issued_at + auth.expires_in;
+    }
+    static sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
     static asArray(value) {
         return Array.isArray(value) ? value : [];

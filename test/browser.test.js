@@ -84,6 +84,107 @@ test('getDeliverySchedule surfaces API timeouts instead of scraping fallback', a
   assert.equal(fallbackCalled, false);
 });
 
+test('ensureApiSession reauthenticates with stored credentials when refresh fails', async () => {
+  const browser = createBrowser();
+  const issuedAt = Math.floor(Date.now() / 1000) - 7200;
+  browser['credentials'] = { email: 'user@example.com', password: 'secret' };
+  browser['apiSession'] = {
+    auth: {
+      access_token: 'expired',
+      expires_in: 1,
+      refresh_token: 'stale-refresh',
+      refresh_expires_in: 7200,
+      token_type: 'Bearer',
+      issued_at: issuedAt,
+    },
+    cookies: [],
+    savedAt: Date.now(),
+  };
+  browser['refreshApiSession'] = async () => false;
+  browser['close'] = async () => {};
+  let reloginCalls = 0;
+  browser['performCredentialLogin'] = async (credentials) => {
+    reloginCalls += 1;
+    assert.equal(credentials.email, 'user@example.com');
+    browser['apiSession'] = {
+      auth: {
+        access_token: 'fresh-token',
+        expires_in: 3600,
+        token_type: 'Bearer',
+        issued_at: Math.floor(Date.now() / 1000),
+      },
+      cookies: [],
+      savedAt: Date.now(),
+    };
+    browser['isLoggedIn'] = true;
+  };
+
+  await browser['ensureApiSession']();
+  assert.equal(reloginCalls, 1);
+  assert.equal(browser['apiSession'].auth.access_token, 'fresh-token');
+});
+
+test('apiRequest retries transient upstream overloads for read requests', async () => {
+  const browser = createBrowser();
+  browser['apiSession'] = {
+    auth: {
+      access_token: 'token',
+      expires_in: 3600,
+      token_type: 'Bearer',
+      issued_at: Math.floor(Date.now() / 1000),
+    },
+    cookies: [],
+    savedAt: Date.now(),
+  };
+  browser['ensureApiSession'] = async () => {};
+  let attempts = 0;
+  const originalSleep = HelloFreshBrowser['sleep'];
+  HelloFreshBrowser['sleep'] = async () => {};
+  browser['apiFetch'] = async () => {
+    attempts += 1;
+    if (attempts < 3) {
+      return new Response('upstream connect error or disconnect/reset before headers. reset reason: overflow', { status: 503 });
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  try {
+    const response = await browser['apiRequest']('/gw/test');
+    assert.deepEqual(response, { ok: true });
+    assert.equal(attempts, 3);
+  } finally {
+    HelloFreshBrowser['sleep'] = originalSleep;
+  }
+});
+
+test('retryAfterDelayMs parses seconds and retryDelayMs honors Retry-After', () => {
+  const browser = createBrowser();
+  const response = new Response('slow down', {
+    status: 429,
+    headers: { 'retry-after': '7' },
+  });
+
+  assert.equal(browser['retryAfterDelayMs']('7'), 7000);
+  assert.equal(browser['retryDelayMs'](response, 0), 7000);
+});
+
+test('retryDelayMs falls back to exponential backoff with jitter cap', () => {
+  const browser = createBrowser();
+  const response = new Response('overflow', { status: 503 });
+  const originalRandom = Math.random;
+  Math.random = () => 0.5;
+  try {
+    assert.equal(browser['retryDelayMs'](response, 0), 500);
+    assert.equal(browser['retryDelayMs'](response, 1), 1000);
+    assert.equal(browser['retryDelayMs'](response, 4), 5000);
+  } finally {
+    Math.random = originalRandom;
+  }
+});
+
 test('normalizeOrderRecord extracts meals, order-line dates, and currency', () => {
   const browser = createBrowser();
   const order = browser['normalizeOrderRecord']({

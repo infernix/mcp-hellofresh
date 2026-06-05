@@ -215,12 +215,14 @@ export declare class HelloFreshBrowser {
     private readonly sessionPath;
     private readonly apiTimeoutMs;
     private apiSession;
+    private credentials;
     private pastDeliveryApiCache;
     private pastOrderCache;
     private pastOrderCacheComplete;
     constructor(options?: HelloFreshBrowserOptions);
     init(): Promise<void>;
     login(credentials: HelloFreshCredentials): Promise<void>;
+    private performCredentialLogin;
     private performInteractiveLogin;
     private waitForEditableLocator;
     private isTransientLoginError;
@@ -346,8 +348,12 @@ export declare class HelloFreshBrowser {
     private apiRequest;
     private apiFetch;
     private fetchWithTimeout;
-    private parseApiResponse;
     private ensureApiSession;
+    private isRetryableApiRequest;
+    private shouldRetryApiFailure;
+    private retryDelayMs;
+    private retryAfterDelayMs;
+    private reauthenticateFromStoredCredentials;
     private activateStoredSession;
     private refreshApiSession;
     private loadSession;
@@ -394,6 +400,7 @@ export declare class HelloFreshBrowser {
     private static isAccessTokenExpired;
     private static isRefreshTokenExpired;
     private static authExpirySeconds;
+    private static sleep;
     private static asArray;
     private static recordValue;
     private static stringValue;
